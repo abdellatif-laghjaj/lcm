@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import argparse
 import wandb
 import os
@@ -11,8 +11,9 @@ from tqdm.auto import tqdm
 from datasets import load_dataset
 import matplotlib.pyplot as plt
 import spacy
+from typing import List, Tuple, Dict, Optional, Union
 
-from baselcm import BaseLCM, SonarEncoder
+from baselcm import BaseLCM, DiffusionLCM, SonarEncoder
 from utils import (
     GloveDataset,
     add_noise_to_embeddings,
@@ -32,22 +33,40 @@ def parse_args():
 
     # Model parameters
     parser.add_argument(
-        "--input_dim", type=int, default=256, help="Input dimension for the model"
+        "--input_dim", type=int, default=512, help="Input dimension for the model"
     )
     parser.add_argument(
-        "--hidden_dim", type=int, default=512, help="Hidden dimension for the model"
+        "--hidden_dim", type=int, default=768, help="Hidden dimension for the model"
     )
     parser.add_argument(
-        "--num_heads", type=int, default=8, help="Number of heads for the model"
+        "--num_heads", type=int, default=12, help="Number of heads for the model"
     )
     parser.add_argument(
-        "--num_layers", type=int, default=6, help="Number of layers for the model"
+        "--num_layers", type=int, default=6, help="Number of transformer layers"
     )
     parser.add_argument(
-        "--ff_dim", type=int, default=2048, help="Feedforward dimension for the model"
+        "--ff_dim", type=int, default=3072, help="Feedforward dimension for the model"
     )
     parser.add_argument(
-        "--output_dim", type=int, default=256, help="Output dimension for the model"
+        "--dropout_rate",
+        type=float,
+        default=0.1,
+        help="Dropout rate for regularization",
+    )
+
+    # Model type selection
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["base", "diffusion"],
+        default="base",
+        help="Type of LCM model: base or diffusion",
+    )
+    parser.add_argument(
+        "--diffusion_steps",
+        type=int,
+        default=10,
+        help="Number of diffusion steps (only for diffusion model)",
     )
 
     # Training parameters
@@ -55,25 +74,28 @@ def parse_args():
         "--batch_size", type=int, default=16, help="Batch size for training"
     )
     parser.add_argument(
-        "--sequence_length", type=int, default=10, help="Sequence length for training"
+        "--eval_batch_size", type=int, default=32, help="Batch size for evaluation"
+    )
+    parser.add_argument(
+        "--sequence_length", type=int, default=5, help="Length of concept sequences"
     )
     parser.add_argument(
         "--epochs", type=int, default=10, help="Number of epochs for training"
     )
     parser.add_argument(
-        "--lr", type=float, default=0.001, help="Learning rate for training"
+        "--lr", type=float, default=0.0001, help="Learning rate for training"
     )
     parser.add_argument(
         "--weight_decay",
         type=float,
         default=1e-4,
-        help="Weight decay (L2 regularization factor)",
+        help="Weight decay (L2 regularization)",
     )
     parser.add_argument(
         "--noise_level",
         type=float,
         default=0.05,
-        help="Noise level for the target embeddings",
+        help="Noise level for diffusion training",
     )
     parser.add_argument(
         "--test_size",
@@ -82,15 +104,33 @@ def parse_args():
         help="Fraction of data to use for testing",
     )
     parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps",
+    )
+    parser.add_argument(
         "--early_stopping", type=int, default=5, help="Early stopping patience"
     )
 
     # Data parameters
     parser.add_argument(
-        "--dataset", type=str, default="wikitext", help="Dataset name: wikitext, bookcorpus, or custom"
+        "--dataset",
+        type=str,
+        default="wikitext",
+        help="Dataset name: wikitext, bookcorpus, custom",
     )
     parser.add_argument(
-        "--dataset_config", type=str, default="wikitext-103-v1", help="Configuration for the dataset"
+        "--dataset_config",
+        type=str,
+        default="wikitext-103-v1",
+        help="Configuration for the dataset",
+    )
+    parser.add_argument(
+        "--data_limit",
+        type=int,
+        default=-1,
+        help="Max rows to use from dataset (-1 for all data)",
     )
     parser.add_argument(
         "--text_column", type=str, default="text", help="Text column in the dataset"
@@ -99,13 +139,12 @@ def parse_args():
         "--lang", type=str, default="en", help="Language for the dataset"
     )
     parser.add_argument(
-        "--data_sample",
-        type=int,
-        default=1000,
-        help="Number of samples to use from the dataset",
+        "--trust_remote_code",
+        action="store_true",
+        help="Trust remote code for dataset loading",
     )
     parser.add_argument(
-        "--trust_remote_code", action="store_true", help="Trust remote code for dataset loading"
+        "--min_sent_length", type=int, default=8, help="Minimum sentence length to keep"
     )
 
     # Other parameters
@@ -131,22 +170,59 @@ def parse_args():
         help="Directory to save models and results",
     )
     parser.add_argument(
-        "--model_name", type=str, default="base_lcm_model", help="Name of the model"
+        "--model_name", type=str, default="lcm_model", help="Name of the model"
     )
     parser.add_argument(
         "--plot_history", action="store_true", help="Plot training history"
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=0,
+        help="Save model every N epochs (0 to disable)",
     )
 
     return parser.parse_args()
 
 
-# Centralized device management
+# Classes and functions to process sentences into concept sequence batches
+class ConceptSequenceDataset(Dataset):
+    """Dataset for handling concept sequences for LCM training.
+
+    Creates sequences of concept embeddings where each sequence is a list of
+    consecutive sentences to predict the next sentence in the sequence.
+    """
+
+    def __init__(self, embeddings, seq_length):
+        """Initialize the dataset.
+
+        Args:
+            embeddings: Tensor of sentence concept embeddings
+            seq_length: Length of sequences to create
+        """
+        self.embeddings = embeddings
+        self.seq_length = seq_length
+
+    def __len__(self):
+        return max(0, len(self.embeddings) - self.seq_length)
+
+    def __getitem__(self, idx):
+        # Get sequence of concepts (sentences)
+        x_seq = self.embeddings[idx : idx + self.seq_length]
+
+        # Get target (next concept/sentence)
+        y = self.embeddings[idx + self.seq_length]
+
+        return x_seq, y
+
+
+# Function to move data to device
 def to_device(data, device):
-    """Move data to specified device.
+    """Move data to the specified device.
 
     Args:
-        data: Data to move
-        device: Device to move the data to
+        data: Data to move (can be tensor, list, tuple)
+        device: Target device
 
     Returns:
         Data on the specified device
@@ -156,96 +232,167 @@ def to_device(data, device):
     return data.to(device)
 
 
-def train_epoch(
-    model, dataloader, target_embeddings, optimizer, criterion, device, batch_size
-):
+def train_epoch(model, dataloader, optimizer, criterion, device, accumulation_steps=1):
     """Train model for one epoch.
 
     Args:
-        model: Model to train
+        model: The LCM model to train
         dataloader: DataLoader for training data
-        target_embeddings: Target embeddings
-        optimizer: Optimizer
+        optimizer: Model optimizer
         criterion: Loss function
         device: Device to use
-        batch_size: Batch size
+        accumulation_steps: Number of gradient accumulation steps
 
     Returns:
         float: Average loss for the epoch
     """
     model.train()
     running_loss = 0.0
+    total_steps = len(dataloader)
 
-    # Wrapping the dataloader with tqdm for batch progress
-    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Training")
+    pbar = tqdm(enumerate(dataloader), total=total_steps, desc="Training")
 
-    for batch_idx, inputs in pbar:
-        inputs = to_device(inputs, device)
-        batch_targets = target_embeddings[
-            batch_idx * batch_size : (batch_idx + 1) * batch_size
-        ]
-        if len(batch_targets) != inputs.size(0):
-            continue  # Skip incomplete batches at the end
+    for step, (x_seq, y) in pbar:
+        # Move data to device
+        x_seq = to_device(x_seq, device)
+        y = to_device(y, device)
 
-        optimizer.zero_grad()
-        output_embeddings = model(inputs)
-        loss = criterion(output_embeddings, batch_targets)
+        # Forward pass
+        y_pred = model(x_seq)
+        loss = criterion(y_pred, y)
+
+        # Scale loss for gradient accumulation
+        loss = loss / accumulation_steps
+
+        # Backward pass
         loss.backward()
-        optimizer.step()
 
-        running_loss += loss.item()
-        pbar.set_postfix(loss=loss.item())
+        # Update weights only after accumulation steps
+        if (step + 1) % accumulation_steps == 0 or (step + 1) == total_steps:
+            optimizer.step()
+            optimizer.zero_grad()
 
-    return running_loss / len(dataloader)
+        # Update running loss
+        running_loss += loss.item() * accumulation_steps
+        pbar.set_postfix({"loss": loss.item() * accumulation_steps})
+
+    return running_loss / total_steps
 
 
-def evaluate(model, dataloader, target_embeddings, criterion, device, batch_size):
-    """Evaluate model.
+def train_diffusion_epoch(
+    model, dataloader, optimizer, criterion, device, noise_level, accumulation_steps=1
+):
+    """Train diffusion LCM for one epoch.
 
     Args:
-        model: Model to evaluate
-        dataloader: DataLoader for evaluation data
-        target_embeddings: Target embeddings
+        model: The DiffusionLCM model to train
+        dataloader: DataLoader for training data
+        optimizer: Model optimizer
         criterion: Loss function
         device: Device to use
-        batch_size: Batch size
+        noise_level: Maximum noise level to add
+        accumulation_steps: Number of gradient accumulation steps
 
     Returns:
-        tuple: Average loss and metrics dictionary
+        float: Average loss for the epoch
+    """
+    model.train()
+    running_loss = 0.0
+    total_steps = len(dataloader)
+
+    pbar = tqdm(enumerate(dataloader), total=total_steps, desc="Training")
+
+    for step, (x_seq, y) in pbar:
+        # Move data to device
+        x_seq = to_device(x_seq, device)
+        y = to_device(y, device)
+
+        # Add random noise to target
+        noise_scale = torch.rand(y.size(0), 1, device=device) * noise_level
+        noisy_y = y + torch.randn_like(y) * noise_scale
+
+        # Random timestep for each example
+        batch_size = y.size(0)
+        timesteps = torch.randint(
+            0, model.diffusion_steps, (batch_size,), device=device
+        )
+
+        # Forward pass with denoising
+        optimizer.zero_grad()
+
+        # Denoise step
+        y_pred = torch.zeros_like(y)
+        for i in range(batch_size):
+            t = timesteps[i].item()
+            y_pred[i] = model.denoise_step(noisy_y[i], x_seq[i : i + 1], t)
+
+        # Compute loss against clean target
+        loss = criterion(y_pred, y)
+
+        # Scale loss for gradient accumulation
+        loss = loss / accumulation_steps
+
+        # Backward pass
+        loss.backward()
+
+        # Update weights only after accumulation steps
+        if (step + 1) % accumulation_steps == 0 or (step + 1) == total_steps:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        # Update running loss
+        running_loss += loss.item() * accumulation_steps
+        pbar.set_postfix({"loss": loss.item() * accumulation_steps})
+
+    return running_loss / total_steps
+
+
+def evaluate(model, dataloader, criterion, device):
+    """Evaluate LCM model.
+
+    Args:
+        model: LCM model to evaluate
+        dataloader: DataLoader for evaluation data
+        criterion: Loss function
+        device: Device to use
+
+    Returns:
+        Tuple: (average loss, metrics dictionary)
     """
     model.eval()
     running_loss = 0.0
-    all_outputs = []
+    all_preds = []
     all_targets = []
 
     with torch.no_grad():
-        for batch_idx, inputs in enumerate(dataloader):
-            inputs = to_device(inputs, device)
-            batch_targets = target_embeddings[
-                batch_idx * batch_size : (batch_idx + 1) * batch_size
-            ]
-            if len(batch_targets) != inputs.size(0):
-                continue  # Skip incomplete batches at the end
+        for x_seq, y in dataloader:
+            # Move data to device
+            x_seq = to_device(x_seq, device)
+            y = to_device(y, device)
 
-            output_embeddings = model(inputs)
-            loss = criterion(output_embeddings, batch_targets)
+            # Forward pass
+            y_pred = model(x_seq)
+            loss = criterion(y_pred, y)
+
+            # Update running loss
             running_loss += loss.item()
 
-            all_outputs.append(output_embeddings.cpu())
-            all_targets.append(batch_targets.cpu())
+            # Store predictions and targets for metrics
+            all_preds.append(y_pred.cpu())
+            all_targets.append(y.cpu())
 
-    # Concatenate all outputs and targets
-    all_outputs = torch.cat(all_outputs, dim=0)
+    # Concatenate all predictions and targets
+    all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
     # Compute metrics
-    metrics = compute_metrics(all_outputs, all_targets)
+    metrics = compute_metrics(all_preds, all_targets)
 
     return running_loss / len(dataloader), metrics
 
 
 def train(args):
-    """Main training function.
+    """Main training function for LCM.
 
     Args:
         args: Command line arguments
@@ -264,18 +411,36 @@ def train(args):
     if args.wandb:
         wandb.init(project=args.wandb_project, config=vars(args))
 
-    # Initialize model
-    model = BaseLCM(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        ff_dim=args.ff_dim,
-        output_dim=args.output_dim,
-    ).to(device)
+    # Initialize model based on selected type
+    print(f"Initializing {args.model_type.upper()} LCM model...")
+    if args.model_type == "diffusion":
+        model = DiffusionLCM(
+            input_dim=args.input_dim,
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            ff_dim=args.ff_dim,
+            output_dim=args.input_dim,  # Output dim must match input for concept embeddings
+            diffusion_steps=args.diffusion_steps,
+            dropout_rate=args.dropout_rate,
+        ).to(device)
+    else:
+        model = BaseLCM(
+            input_dim=args.input_dim,
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            ff_dim=args.ff_dim,
+            output_dim=args.input_dim,  # Output dim must match input for concept embeddings
+            dropout_rate=args.dropout_rate,
+        ).to(device)
 
-    # Initialize encoder
-    print("Initializing encoder...")
+    # Count model parameters
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model has {num_params:,} trainable parameters")
+
+    # Initialize SONAR encoder
+    print("Initializing SONAR encoder...")
     encoder = SonarEncoder(device=device)
 
     # Load dataset
@@ -283,51 +448,53 @@ def train(args):
     try:
         # Handle different datasets
         if args.dataset.lower() == "wikitext":
-            # WikiText is a reliable dataset that works well without trust_remote_code
             dataset_name = "wikitext" if args.dataset_config else "wikitext-103-v1"
-            df = load_dataset(dataset_name, args.dataset_config, split="train")
-            if args.data_sample > 0 and args.data_sample < len(df):
-                df = df.select(range(args.data_sample))
+            raw_dataset = load_dataset(dataset_name, args.dataset_config, split="train")
 
         elif args.dataset.lower() == "bookcorpus":
-            # BookCorpus is another good alternative
-            df = load_dataset("bookcorpus", split="train")
-            if args.data_sample > 0 and args.data_sample < len(df):
-                df = df.select(range(args.data_sample))
+            raw_dataset = load_dataset("bookcorpus", split="train")
 
-        elif args.dataset.lower() == "oscar":
-            # Only use oscar if trust_remote_code is explicitly set
-            if not args.trust_remote_code:
-                raise ValueError("Oscar dataset requires trust_remote_code=True")
-            df = load_dataset(
-                args.dataset, args.dataset_config, split="train", trust_remote_code=True
-            )
-            if args.data_sample > 0 and args.data_sample < len(df):
-                df = df.select(range(args.data_sample))
+        elif args.dataset.lower() == "custom":
+            # For custom datasets, load from the provided path
+            if not args.dataset_config:
+                raise ValueError("Must provide dataset_config path for custom dataset")
+            raw_dataset = load_dataset(args.dataset_config, split="train")
 
         else:
             # Try to load the dataset as specified
             if args.trust_remote_code:
-                df = load_dataset(
-                    args.dataset, args.dataset_config, split="train", trust_remote_code=True
+                raw_dataset = load_dataset(
+                    args.dataset,
+                    args.dataset_config,
+                    split="train",
+                    trust_remote_code=True,
                 )
             else:
-                df = load_dataset(args.dataset, args.dataset_config, split="train")
+                raw_dataset = load_dataset(
+                    args.dataset, args.dataset_config, split="train"
+                )
 
-            if args.data_sample > 0 and args.data_sample < len(df):
-                df = df.select(range(args.data_sample))
+        # Use all data unless explicitly limited
+        if args.data_limit > 0:
+            raw_dataset = raw_dataset.select(
+                range(min(args.data_limit, len(raw_dataset)))
+            )
+            print(f"Using {len(raw_dataset)} rows from dataset")
+        else:
+            print(f"Using all {len(raw_dataset)} rows from dataset")
 
     except Exception as e:
         print(f"Error loading dataset: {e}")
         print("Using WikiText-103 as fallback dataset...")
-        df = load_dataset("wikitext", "wikitext-103-v1", split="train")
-        if args.data_sample > 0 and args.data_sample < len(df):
-            df = df.select(range(args.data_sample))
+        raw_dataset = load_dataset("wikitext", "wikitext-103-v1", split="train")
 
-    print(f"Successfully loaded dataset with {len(df)} examples")
+        if args.data_limit > 0:
+            raw_dataset = raw_dataset.select(
+                range(min(args.data_limit, len(raw_dataset)))
+            )
 
-    # Split text into sentences
-    print("Splitting text into sentences...")
+    # Initialize or load spaCy for sentence splitting
+    print("Initializing NLP model for sentence splitting...")
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
@@ -343,73 +510,105 @@ def train(args):
             return []
         try:
             doc = nlp(text)
-            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+            # Only keep sentences with minimum length to filter out headers, code, etc.
+            sentences = [
+                sent.text.strip()
+                for sent in doc.sents
+                if sent.text.strip() and len(sent.text.split()) >= args.min_sent_length
+            ]
             return sentences
         except Exception as e:
             print(f"Error processing text: {e}")
             return []
 
-    processed_texts = []
-    for text in tqdm(df[args.text_column], desc="Processing Texts"):
-        sentences = split_into_sentences(text)
-        if sentences:  # Only add non-empty sentences
-            processed_texts.extend(sentences)
+    # Process the dataset to extract sentences
+    print("Processing dataset into sentences...")
+    all_sentences = []
 
-    print(f"Number of sentences: {len(processed_texts)}")
+    # Process in batches to avoid memory issues with very large datasets
+    batch_size = 1000
+    for i in tqdm(range(0, len(raw_dataset), batch_size), desc="Processing Texts"):
+        batch = raw_dataset[i : min(i + batch_size, len(raw_dataset))]
+        for text in tqdm(
+            batch[args.text_column], desc="Extracting Sentences", leave=False
+        ):
+            sentences = split_into_sentences(text)
+            all_sentences.extend(sentences)
 
-    # Ensure we have enough data
-    if len(processed_texts) < 100:
-        print("Warning: Not enough sentences extracted. Using raw texts instead.")
-        processed_texts = [
-            text for text in df[args.text_column] if isinstance(text, str) and text.strip()
-        ]
-        print(f"Number of raw texts: {len(processed_texts)}")
+    print(f"Extracted {len(all_sentences)} sentences from dataset")
 
-    # Encode the processed sentences
-    print("Encoding sentences...")
-    input_embeddings, stats = setup_data_processing_pipeline(
-        processed_texts, encoder, lang=args.lang, batch_size=args.batch_size
-    )
-    input_embeddings = input_embeddings.to(device)
+    # Encode all sentences to concept embeddings
+    print("Encoding sentences to concept embeddings...")
+    # Process in manageable batches
+    encoder_batch_size = min(32, args.batch_size)
 
-    # Update model with statistics for normalization
-    model.prenet.scaler_mean = stats["mean"].mean().item()
-    model.prenet.scaler_std = stats["std"].mean().item()
-    model.postnet.scaler_mean = stats["mean"].mean().item()
-    model.postnet.scaler_std = stats["std"].mean().item()
+    # Use custom chunking for very large datasets
+    chunk_size = 100000  # Process this many sentences at a time
+    all_embeddings = []
+
+    for chunk_start in range(0, len(all_sentences), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, len(all_sentences))
+        print(f"Processing sentences {chunk_start} to {chunk_end}...")
+
+        chunk_sentences = all_sentences[chunk_start:chunk_end]
+        chunk_embeddings = encoder.encode(
+            chunk_sentences, lang=args.lang, batch_size=encoder_batch_size
+        )
+        all_embeddings.append(chunk_embeddings)
+
+    # Concatenate all embeddings
+    concept_embeddings = torch.cat(all_embeddings, dim=0)
+    print(f"Generated {concept_embeddings.shape} concept embeddings")
 
     # Free up memory
-    del encoder
+    del encoder, all_sentences, all_embeddings
     torch.cuda.empty_cache()
 
-    # Split data into train and test sets
-    train_embeddings, test_embeddings = split_train_test(
-        input_embeddings, args.test_size
+    # Compute embedding statistics for normalization
+    mean = torch.mean(concept_embeddings, dim=0)
+    std = torch.std(concept_embeddings, dim=0)
+    print(
+        f"Embedding stats - Mean: {mean.mean().item():.4f}, Std: {std.mean().item():.4f}"
     )
 
-    # Create datasets and dataloaders
-    train_dataset = GloveDataset(
-        train_embeddings, args.sequence_length, args.batch_size
-    )
-    test_dataset = GloveDataset(test_embeddings, args.sequence_length, args.batch_size)
+    # Update model with statistics for normalization
+    model.prenet.scaler_mean = mean.mean().item()
+    model.prenet.scaler_std = std.mean().item()
+    model.postnet.scaler_mean = mean.mean().item()
+    model.postnet.scaler_std = std.mean().item()
 
+    # Split data into train and validation sets
+    train_embeddings, val_embeddings = split_train_test(
+        concept_embeddings, test_size=args.test_size
+    )
+
+    # Create datasets for sequence prediction
+    print("Creating sequence datasets...")
+    train_dataset = ConceptSequenceDataset(train_embeddings, args.sequence_length)
+    val_dataset = ConceptSequenceDataset(val_embeddings, args.sequence_length)
+
+    print(
+        f"Training sequences: {len(train_dataset)}, Validation sequences: {len(val_dataset)}"
+    )
+
+    # Create data loaders
     train_dataloader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True
-    )
-    test_dataloader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,  # Drop incomplete batches
     )
 
-    # Create target embeddings with noise
-    train_targets = add_noise_to_embeddings(train_embeddings, args.noise_level).to(
-        device
+    val_dataloader = DataLoader(
+        val_dataset, batch_size=args.eval_batch_size, shuffle=False
     )
-    test_targets = add_noise_to_embeddings(test_embeddings, args.noise_level).to(device)
 
     # Initialize optimizer and loss function
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+
+    # MSE loss for concept embedding prediction
     criterion = nn.MSELoss()
 
     # Learning rate scheduler
@@ -432,21 +631,29 @@ def train(args):
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
 
-        # Train
-        train_loss = train_epoch(
-            model,
-            train_dataloader,
-            train_targets,
-            optimizer,
-            criterion,
-            device,
-            args.batch_size,
-        )
+        # Train epoch
+        if args.model_type == "diffusion":
+            train_loss = train_diffusion_epoch(
+                model,
+                train_dataloader,
+                optimizer,
+                criterion,
+                device,
+                args.noise_level,
+                args.gradient_accumulation_steps,
+            )
+        else:
+            train_loss = train_epoch(
+                model,
+                train_dataloader,
+                optimizer,
+                criterion,
+                device,
+                args.gradient_accumulation_steps,
+            )
 
         # Evaluate
-        val_loss, val_metrics = evaluate(
-            model, test_dataloader, test_targets, criterion, device, args.batch_size
-        )
+        val_loss, val_metrics = evaluate(model, val_dataloader, criterion, device)
 
         # Update learning rate
         scheduler.step(val_loss)
@@ -461,8 +668,8 @@ def train(args):
         print(
             f"Epoch {epoch+1}/{args.epochs} - "
             f"Time: {epoch_time:.2f}s - "
-            f"Train Loss: {train_loss:.4f} - "
-            f"Val Loss: {val_loss:.4f} - "
+            f"Train Loss: {train_loss:.6f} - "
+            f"Val Loss: {val_loss:.6f} - "
             f"Cosine Sim: {val_metrics['cosine_similarity']:.4f}"
         )
 
@@ -478,6 +685,13 @@ def train(args):
                 }
             )
 
+        # Save model periodically if requested
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            checkpoint_path = os.path.join(
+                args.save_dir, f"{args.model_name}_epoch{epoch+1}.pth"
+            )
+            model.save(checkpoint_path)
+
         # Early stopping and model saving
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -485,11 +699,11 @@ def train(args):
 
             # Save best model
             model.save(best_model_path)
-            print(f"Saved best model with validation loss: {best_val_loss:.4f}")
+            print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         else:
             early_stopping_counter += 1
             print(
-                f"EarlyStopping counter: {early_stopping_counter} out of {args.early_stopping}"
+                f"Early stopping counter: {early_stopping_counter} out of {args.early_stopping}"
             )
 
             if early_stopping_counter >= args.early_stopping:
