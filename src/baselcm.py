@@ -86,7 +86,11 @@ class SonarEncoder:
                     continue  # Skip this batch
 
         if not all_embeddings:
-            return torch.empty((0, self.encoder.config.d_model), dtype=torch.float32, device=self.device)
+            return torch.empty(
+                (0, self.encoder.config.d_model),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         return torch.cat(all_embeddings, dim=0)
 
@@ -109,14 +113,20 @@ class SonarDecoder:
             device (str): The device ('cpu' or 'cuda') to run the model on.
         """
         from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
-        
-        self.model = M2M100ForConditionalGeneration.from_pretrained(model_name).to(device)
+
+        self.model = M2M100ForConditionalGeneration.from_pretrained(model_name).to(
+            device
+        )
         self.tokenizer = M2M100Tokenizer.from_pretrained(model_name)
         self.device = device
         print(f"SonarDecoder initialized on device: {self.device}")
 
     def decode(
-        self, embeddings: torch.Tensor, tgt_lang: str, max_length: int = 100, num_beams: int = 4
+        self,
+        embeddings: torch.Tensor,
+        tgt_lang: str,
+        max_length: int = 100,
+        num_beams: int = 4,
     ) -> List[str]:
         """
         Decodes embeddings back to text.
@@ -131,20 +141,20 @@ class SonarDecoder:
             List[str]: Decoded sentences.
         """
         self.tokenizer.tgt_lang = tgt_lang
-        
+
         # Move embeddings to decoder's device if needed
         embeddings = embeddings.to(self.device)
-        
+
         # Set decoder_start_token_id based on target language
         self.model.config.decoder_start_token_id = self.tokenizer.get_lang_id(tgt_lang)
-        
+
         # Generate text from embeddings using beam search
         decoded_text = []
         with torch.inference_mode():
             for emb in tqdm(embeddings, desc="Decoding", unit="embedding"):
                 # Reshape embedding for model
                 encoder_hidden_states = emb.unsqueeze(0).unsqueeze(0)
-                
+
                 # Generate text
                 output_ids = self.model.generate(
                     encoder_outputs=[encoder_hidden_states],
@@ -152,11 +162,11 @@ class SonarDecoder:
                     num_beams=num_beams,
                     early_stopping=True,
                 )
-                
+
                 # Decode the generated token IDs into text
                 text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
                 decoded_text.append(text)
-        
+
         return decoded_text
 
 
