@@ -2,11 +2,40 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import mean_squared_error, cosine_similarity
+from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict, Optional, Union
 import os
 import json
+
+
+def cosine_similarity(X, Y=None):
+    """Compute cosine similarity between samples in X and Y.
+
+    Args:
+        X: First set of samples (n_samples_X, n_features)
+        Y: Second set of samples (n_samples_Y, n_features), optional
+
+    Returns:
+        array: Cosine similarity matrix
+    """
+    # Convert to numpy if tensors
+    if isinstance(X, torch.Tensor):
+        X = X.detach().cpu().numpy()
+    if Y is not None and isinstance(Y, torch.Tensor):
+        Y = Y.detach().cpu().numpy()
+
+    if Y is None:
+        Y = X
+
+    # Normalize
+    X_normalized = X / np.linalg.norm(X, axis=1, keepdims=True)
+    Y_normalized = Y / np.linalg.norm(Y, axis=1, keepdims=True)
+
+    # Compute similarity
+    similarity = np.dot(X_normalized, Y_normalized.T)
+
+    return similarity
 
 
 def add_noise_to_embeddings(embeddings, noise_level=0.1):
