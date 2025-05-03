@@ -9,26 +9,36 @@ if __name__ == "__main__":
     """
     # Check if CUDA is available and set options accordingly
     cuda_available = torch.cuda.is_available()
-    
+
     # Base command with settings that work on any machine
     cmd = [
-        "python", "train.py",
-        "--model_type", "diffusion",
-        "--diffusion_steps", "10",
-        "--max_train_samples", "5000",  # Use only 5000 samples for quick iterations
-        "--max_val_samples", "500",     # Use only 500 validation samples
-        "--batch_size", "4",            # Small batch size to fit in memory
-        "--gradient_accumulation_steps", "8",  # Effective batch size of 32
-        "--epochs", "3",                # Run fewer epochs for testing
-        "--checkpoint_interval", "10",  # Save checkpoints every 10 minutes
-        "--warmup_steps", "100",        # Shorter warmup
+        "python",
+        "train.py",
+        "--model_type",
+        "diffusion",
+        "--diffusion_steps",
+        "10",
+        "--max_train_samples",
+        "5000",  # Use only 5000 samples for quick iterations
+        "--max_val_samples",
+        "500",  # Use only 500 validation samples
+        "--batch_size",
+        "4",  # Small batch size to fit in memory
+        "--gradient_accumulation_steps",
+        "8",  # Effective batch size of 32
+        "--epochs",
+        "3",  # Run fewer epochs for testing
+        "--checkpoint_interval",
+        "10",  # Save checkpoints every 10 minutes
+        "--warmup_steps",
+        "100",  # Shorter warmup
     ]
-    
+
     # Add CUDA-specific optimizations only if available
     if cuda_available:
-        cmd.append("--fp16")            # Only use mixed precision with CUDA
-        cmd.append("--pin_memory")      # Only use pin_memory with CUDA
-        cmd.append("--num_workers")     # Use dataloader workers with CUDA
+        cmd.append("--fp16")  # Only use mixed precision with CUDA
+        cmd.append("--pin_memory")  # Only use pin_memory with CUDA
+        cmd.append("--num_workers")  # Use dataloader workers with CUDA
         cmd.append("2")
     else:
         print("CUDA is not available, running in CPU-only mode (slower)")
@@ -37,12 +47,12 @@ if __name__ == "__main__":
         cmd.append("2")
         cmd.append("--gradient_accumulation_steps")
         cmd.append("16")
-    
+
     # Add any additional arguments from command line
     cmd.extend(sys.argv[1:])
-    
+
     # Print the command being run
     print("Running command:", " ".join(cmd))
-    
+
     # Execute the command
     os.system(" ".join(cmd))

@@ -39,8 +39,10 @@ def train(
     # Check if mixed precision is available and enabled
     use_fp16 = fp16 and device.type == "cuda" and torch.cuda.is_available()
     if fp16 and not use_fp16:
-        print("Warning: Mixed precision (fp16) requested but CUDA is not available. Using standard precision instead.")
-    
+        print(
+            "Warning: Mixed precision (fp16) requested but CUDA is not available. Using standard precision instead."
+        )
+
     # Initialize scaler for mixed precision training only if available
     scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
 
@@ -80,7 +82,9 @@ def train(
                     # Clip gradients
                     if clip_grad_norm > 0:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), clip_grad_norm
+                        )
 
                     scaler.step(optimizer)
                     scaler.update()
@@ -103,7 +107,9 @@ def train(
                 if (i + 1) % gradient_accumulation_steps == 0:
                     # Clip gradients
                     if clip_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), clip_grad_norm
+                        )
 
                     optimizer.step()
                     if scheduler is not None:
@@ -118,7 +124,10 @@ def train(
             # Log to wandb periodically to reduce overhead
             if i % 10 == 0:
                 wandb.log(
-                    {"train_loss": full_loss, "learning_rate": optimizer.param_groups[0]["lr"]}
+                    {
+                        "train_loss": full_loss,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                    }
                 )
 
             # Save checkpoint based on time interval
@@ -150,7 +159,9 @@ def train(
             # Use a subset of validation data if specified
             val_dataset = val_loader.dataset
             if max_val_samples and max_val_samples < len(val_dataset):
-                indices = np.random.choice(len(val_dataset), max_val_samples, replace=False)
+                indices = np.random.choice(
+                    len(val_dataset), max_val_samples, replace=False
+                )
                 val_dataset = Subset(val_dataset, indices)
                 val_bar = tqdm(
                     DataLoader(
@@ -237,23 +248,40 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument(
+        "--batch_size", type=int, default=8, help="Batch size for training"
+    )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=4,
         help="Number of gradient accumulation steps",
     )
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs to train")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Learning rate warmup steps")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for optimizer")
-    parser.add_argument("--fp16", action="store_true", help="Use mixed precision training")
-    parser.add_argument("--clip_grad_norm", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument(
+        "--epochs", type=int, default=5, help="Number of epochs to train"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=5e-5, help="Learning rate"
+    )
+    parser.add_argument(
+        "--warmup_steps", type=int, default=500, help="Learning rate warmup steps"
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.01, help="Weight decay for optimizer"
+    )
+    parser.add_argument(
+        "--fp16", action="store_true", help="Use mixed precision training"
+    )
+    parser.add_argument(
+        "--clip_grad_norm", type=float, default=1.0, help="Gradient clipping norm"
+    )
 
     # Dataset parameters
     parser.add_argument(
-        "--dataset", type=str, default="cnn_dailymail", help="Dataset to use for training"
+        "--dataset",
+        type=str,
+        default="cnn_dailymail",
+        help="Dataset to use for training",
     )
     parser.add_argument(
         "--dataset_version",
@@ -293,7 +321,7 @@ def main():
         default=None,
         help="Resume training from this checkpoint file",
     )
-    
+
     # Performance options
     parser.add_argument(
         "--num_workers",
@@ -304,7 +332,7 @@ def main():
     parser.add_argument(
         "--pin_memory",
         action="store_true",
-        help="Pin memory for faster data transfer (only useful with CUDA)"
+        help="Pin memory for faster data transfer (only useful with CUDA)",
     )
 
     args = parser.parse_args()
@@ -321,7 +349,9 @@ def main():
     dataset = load_dataset(args.dataset, args.dataset_version)
 
     # Optionally limit the number of training samples (for debugging)
-    if args.max_train_samples is not None and args.max_train_samples < len(dataset["train"]):
+    if args.max_train_samples is not None and args.max_train_samples < len(
+        dataset["train"]
+    ):
         dataset["train"] = dataset["train"].select(range(args.max_train_samples))
         print(f"Limited training dataset to {args.max_train_samples} samples")
 
@@ -363,10 +393,10 @@ def main():
     # Check if CUDA is available for pin_memory and num_workers
     use_cuda = torch.cuda.is_available()
     pin_memory = args.pin_memory and use_cuda
-    
+
     # Reduce num_workers if not on a machine that can handle it
     num_workers = args.num_workers if use_cuda else 0
-    
+
     train_loader = DataLoader(
         dataset["train"],
         batch_size=args.batch_size,
@@ -386,7 +416,9 @@ def main():
     )
 
     # Setup training
-    criterion = nn.MSELoss() if args.model_type == "base" else None  # Diffusion models handle loss internally
+    criterion = (
+        nn.MSELoss() if args.model_type == "base" else None
+    )  # Diffusion models handle loss internally
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
