@@ -4,7 +4,7 @@ import spacy
 from tqdm.auto import tqdm
 import numpy as np
 
-from baselcm import BaseLCM, SonarEncoder
+from baselcm import BaseLCM, SonarEncoder, SonarDecoder
 from utils import add_noise_to_embeddings  # Assuming add_noise is in utils
 
 # Set random seed for reproducibility if needed
@@ -15,7 +15,7 @@ from utils import add_noise_to_embeddings  # Assuming add_noise is in utils
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate embeddings using a trained BaseLCM model"
+        description="Generate text using a trained BaseLCM model"
     )
     # Model & Data Args
     parser.add_argument(
@@ -59,6 +59,11 @@ def parse_args():
     )
     parser.add_argument(
         "--noise_level", type=float, default=0.05, help="Noise level for denoising mode"
+    )
+    parser.add_argument(
+        "--output_text", 
+        action="store_true", 
+        help="Decode the embeddings to text"
     )
 
     # Model Config (must match the trained model)
@@ -106,14 +111,20 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Force device ('cuda', 'cpu'). Auto-detects if None.",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device ('cuda', 'cpu'). Default uses CUDA if available.",
     )
     parser.add_argument(
         "--encoding_batch_size",
         type=int,
         default=32,
         help="Batch size for sentence encoding",
+    )
+    parser.add_argument(
+        "--max_output_length",
+        type=int,
+        default=100,
+        help="Maximum length of the generated text when decoding embeddings"
     )
 
     return parser.parse_args()
@@ -185,9 +196,7 @@ def generate(args):
     print("Encoding initial sentences...")
     initial_embeddings = encoder.encode(
         input_sentences, lang=args.lang, batch_size=args.encoding_batch_size
-    ).to(
-        device
-    )  # Keep embeddings on the target device
+    ).to(device)  # Keep embeddings on the device
 
     if initial_embeddings.shape[0] == 0:
         print("Error: Failed to encode initial sentences.")
@@ -195,6 +204,7 @@ def generate(args):
 
     # --- 3. Perform Generation/Testing ---
     generated_embeddings_list = [initial_embeddings]
+    generated_text_list = input_sentences.copy()  # Store input sentences as initial text
 
     with torch.inference_mode():
         if args.mode == "continuation":
@@ -219,13 +229,28 @@ def generate(args):
                 ]  # Shape: (1, output_dim)
 
                 # Append the predicted embedding (remove batch dim)
-                generated_embeddings_list.append(next_embedding.cpu())  # Store on CPU
+                generated_embeddings_list.append(next_embedding)
                 current_sequence = torch.cat(
-                    [current_sequence, next_embedding.to(current_sequence.device)],
+                    [current_sequence, next_embedding],
                     dim=0,
                 )
 
             print("Continuation generation complete.")
+
+            # Decode generated embeddings to text if requested
+            if args.output_text:
+                print("Decoding generated embeddings to text...")
+                decoder = SonarDecoder(device=str(device))
+                
+                # Decode each new embedding (not including initial embeddings)
+                for i in range(1, len(generated_embeddings_list)):
+                    generated_text = decoder.decode(
+                        generated_embeddings_list[i], 
+                        tgt_lang=args.lang,
+                        max_length=args.max_output_length
+                    )
+                    generated_text_list.extend(generated_text)
+                    print(f"Generated Step {i} text: {generated_text[0]}")
 
         elif args.mode == "denoising":
             print("Performing denoising test...")
@@ -241,22 +266,22 @@ def generate(args):
             # Predict next step from clean context
             clean_input_tensor = context_sequence.unsqueeze(0)  # Add batch dim
             clean_pred_output = model(clean_input_tensor)
-            clean_next_embedding = clean_pred_output[:, -1, :].cpu()  # Store on CPU
+            clean_next_embedding = clean_pred_output[:, -1, :]  # Keep on device
 
             # Predict next step from noisy context
-            noisy_context = add_noise_to_embeddings(context_sequence, args.noise_level)
+            noisy_context = add_noise_to_embeddings(context_sequence, args.noise_level).to(device)
             noisy_input_tensor = noisy_context.unsqueeze(0)  # Add batch dim
             noisy_pred_output = model(noisy_input_tensor)
-            noisy_next_embedding = noisy_pred_output[:, -1, :].cpu()  # Store on CPU
+            noisy_next_embedding = noisy_pred_output[:, -1, :]  # Keep on device
 
             print("Denoising test complete.")
             print(
                 "Predicted embedding from CLEAN context (first 5 dims):",
-                clean_next_embedding.flatten()[:5].numpy(),
+                clean_next_embedding.flatten()[:5].cpu().numpy(),
             )
             print(
                 "Predicted embedding from NOISY context (first 5 dims):",
-                noisy_next_embedding.flatten()[:5].numpy(),
+                noisy_next_embedding.flatten()[:5].cpu().numpy(),
             )
             # Compare the two predictions
             similarity = torch.nn.functional.cosine_similarity(
@@ -265,12 +290,36 @@ def generate(args):
             print(
                 f"Cosine Similarity between clean/noisy predictions: {similarity.item():.4f}"
             )
-            # We only have the predictions, not the ground truth next step here.
+            
+            # We have the predictions, store them for potential decoding
             generated_embeddings_list = [
-                context_sequence.cpu(),
                 clean_next_embedding,
                 noisy_next_embedding,
             ]
+            
+            # Decode to text if requested
+            if args.output_text:
+                print("Decoding predicted embeddings to text...")
+                decoder = SonarDecoder(device=str(device))
+                
+                # Decode clean prediction
+                clean_text = decoder.decode(
+                    clean_next_embedding, 
+                    tgt_lang=args.lang,
+                    max_length=args.max_output_length
+                )
+                print(f"Predicted text from CLEAN context: {clean_text[0]}")
+                
+                # Decode noisy prediction
+                noisy_text = decoder.decode(
+                    noisy_next_embedding, 
+                    tgt_lang=args.lang,
+                    max_length=args.max_output_length
+                )
+                print(f"Predicted text from NOISY context: {noisy_text[0]}")
+                
+                generated_text_list.extend(clean_text)
+                generated_text_list.extend(noisy_text)
 
     # --- 4. Output Results ---
     print("\n--- Results ---")
@@ -278,28 +327,31 @@ def generate(args):
 
     if args.mode == "continuation":
         print(f"Generated {args.num_steps} additional concept embeddings.")
-        print("Initial context embeddings shape:", generated_embeddings_list[0].shape)
-        for i in range(1, len(generated_embeddings_list)):
-            print(
-                f"Generated Step {i} embedding shape: {generated_embeddings_list[i].shape}"
-            )
-            print(
-                f"  Embedding (first 5 dims): {generated_embeddings_list[i].flatten()[:5].numpy()}"
-            )
-        # Combine all generated embeddings into a single tensor for potential saving/analysis
-        final_embedding_sequence = torch.cat(generated_embeddings_list, dim=0)
-        print("Full generated sequence shape:", final_embedding_sequence.shape)
-        # np.save("generated_embeddings.npy", final_embedding_sequence.numpy()) # Optional: save
-        # print("Saved generated embeddings to generated_embeddings.npy")
+        
+        if args.output_text:
+            print("\nGenerated text sequence:")
+            for i, text in enumerate(generated_text_list):
+                prefix = "Input" if i < len(input_sentences) else f"Generated {i - len(input_sentences) + 1}"
+                print(f"{prefix}: {text}")
+        else:
+            print("Initial context embeddings shape:", generated_embeddings_list[0].shape)
+            for i in range(1, len(generated_embeddings_list)):
+                print(
+                    f"Generated Step {i} embedding shape: {generated_embeddings_list[i].shape}"
+                )
+                print(
+                    f"  Embedding (first 5 dims): {generated_embeddings_list[i].flatten()[:5].cpu().numpy()}"
+                )
+            # Combine all generated embeddings into a single tensor for potential saving/analysis
+            final_embedding_sequence = torch.cat(generated_embeddings_list, dim=0)
+            print("Full generated sequence shape:", final_embedding_sequence.shape)
+            print("\nTo see text output instead of embeddings, run with --output_text flag")
 
     elif args.mode == "denoising":
-        print("Context sequence shape:", generated_embeddings_list[0].shape)
-        print("Clean prediction shape:", generated_embeddings_list[1].shape)
-        print("Noisy prediction shape:", generated_embeddings_list[2].shape)
-
-    print(
-        "\nNOTE: Output consists of embeddings. Decoding requires the corresponding Sonar Decoder model."
-    )
+        if not args.output_text:
+            print("Clean prediction shape:", generated_embeddings_list[0].shape)
+            print("Noisy prediction shape:", generated_embeddings_list[1].shape)
+            print("\nTo see text output instead of embeddings, run with --output_text flag")
 
 
 if __name__ == "__main__":

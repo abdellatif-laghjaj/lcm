@@ -131,6 +131,19 @@ def parse_args():
         default="saved_models",
         help="Directory to save trained models",
     )
+    # New argument for gradient accumulation
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps for larger effective batch size",
+    )
+    # New argument for mixed precision training
+    parser.add_argument(
+        "--mixed_precision",
+        action="store_true",
+        help="Enable mixed precision training for faster performance",
+    )
 
     # Logging & Misc
     parser.add_argument(
@@ -139,8 +152,15 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Force device ('cuda', 'cpu'). Auto-detects if None.",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Force device ('cuda', 'cpu'). Default uses CUDA if available.",
+    )
+    # New checkpoint save frequency argument
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs (0 to save only at the end)",
     )
 
     return parser.parse_args()
@@ -223,7 +243,7 @@ def train(args):
     encoder = SonarEncoder(device=str(device))  # Ensure device is string
 
     print("Encoding sentences...")
-    # Ensure embeddings end up on the correct device *after* potential CPU offloading in encode()
+    # Ensure embeddings end up on the correct device
     all_embeddings = encoder.encode(
         all_sentences, lang=args.lang, batch_size=args.encoding_batch_size
     ).to(device)
@@ -251,7 +271,7 @@ def train(args):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
-        # persistent_workers=(num_workers > 0) # Can uncomment if needed
+        persistent_workers=(num_workers > 0),
     )
     print(f"Dataset size: {len(train_dataset)} sequences")
 
@@ -267,44 +287,88 @@ def train(args):
         max_seq_len=args.max_seq_len_model,  # Pass max sequence length
     ).to(device)
 
+    # Enable parameter count logging
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     criterion = nn.MSELoss()
+    
+    # Setup mixed precision if requested
+    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
+    
+    # Optional learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+    )
 
     # --- 5. Training Loop ---
     print("Starting training...")
     for epoch in range(args.epoch):
         model.train()
         running_loss = 0.0
-
+        
         # Wrap dataloader with tqdm for progress bar
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epoch}", leave=False)
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epoch}", leave=True)
+        
+        # Reset gradient accumulation counter
+        grad_accum_counter = 0
+        optimizer.zero_grad()
+        
         for batch_idx, (input_seq, target_emb) in enumerate(pbar):
             # Move data to device
-            input_seq = input_seq.to(device)
-            target_emb = target_emb.to(device)
+            input_seq = input_seq.to(device, non_blocking=True)
+            target_emb = target_emb.to(device, non_blocking=True)
 
             # Add noise to input sequence
             noisy_input_seq = add_noise_to_embeddings(input_seq, args.noise_level)
-
-            optimizer.zero_grad()
-
-            # Get model prediction (predicts embedding for the *next* step after the sequence)
-            # The model outputs predictions for each position in the input sequence.
-            # We are interested in the prediction based on the *entire* input sequence,
-            # which corresponds to the output at the *last* position of the sequence.
-            output_embeddings_seq = model(noisy_input_seq)
-            predicted_next_emb = output_embeddings_seq[
-                :, -1, :
-            ]  # Get prediction from the last time step
-
-            loss = criterion(predicted_next_emb, target_emb)
-
-            loss.backward()
-            # Optional: Gradient clipping
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            
+            # Use mixed precision if requested
+            if args.mixed_precision:
+                with torch.cuda.amp.autocast():
+                    # Forward pass
+                    output_embeddings_seq = model(noisy_input_seq)
+                    predicted_next_emb = output_embeddings_seq[:, -1, :]
+                    loss = criterion(predicted_next_emb, target_emb)
+                
+                # Scale loss and do backward pass
+                scaler.scale(loss / args.grad_accum_steps).backward()
+                grad_accum_counter += 1
+                
+                # Update weights if gradient accumulation steps reached
+                if grad_accum_counter == args.grad_accum_steps:
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    grad_accum_counter = 0
+            else:
+                # Traditional training path without mixed precision
+                output_embeddings_seq = model(noisy_input_seq)
+                predicted_next_emb = output_embeddings_seq[:, -1, :]
+                
+                loss = criterion(predicted_next_emb, target_emb)
+                (loss / args.grad_accum_steps).backward()
+                
+                grad_accum_counter += 1
+                
+                # Update weights if gradient accumulation steps reached
+                if grad_accum_counter == args.grad_accum_steps:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    grad_accum_counter = 0
 
             running_loss += loss.item()
 
@@ -312,17 +376,44 @@ def train(args):
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
                 avg_loss=f"{running_loss / (batch_idx + 1):.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
+
+        # Make sure we update the weights if any gradients are still pending at the end of the epoch
+        if grad_accum_counter > 0:
+            if args.mixed_precision:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad()
 
         epoch_loss = running_loss / len(train_dataloader)
         print(f"Epoch {epoch+1}/{args.epoch} - Average Loss: {epoch_loss:.4f}")
+        
+        # Update learning rate scheduler
+        scheduler.step(epoch_loss)
 
         if args.wandb:
-            wandb.log({"epoch": epoch + 1, "loss": epoch_loss})
+            wandb.log({
+                "epoch": epoch + 1, 
+                "loss": epoch_loss,
+                "learning_rate": optimizer.param_groups[0]['lr']
+            })
+
+        # Save checkpoint if requested
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            os.makedirs(args.save_dir, exist_ok=True)
+            checkpoint_path = os.path.join(args.save_dir, f"base_lcm_checkpoint_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Checkpoint saved at {checkpoint_path}")
 
     print("Training Complete!")
 
-    # --- 6. Save Model ---
+    # --- 6. Save Final Model ---
     os.makedirs(args.save_dir, exist_ok=True)
     save_path = os.path.join(args.save_dir, "base_lcm_model.pth")
     torch.save(model.state_dict(), save_path)
