@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 from datasets import load_dataset
 
 from baselcm import BaseLCM, SonarEncoder
-from utils import compute_metrics, load_config
+from utils import compute_metrics, load_config, cosine_similarity
 
 
 def parse_args():
