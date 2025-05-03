@@ -36,8 +36,13 @@ def train(
     # Create checkpoint directory if it doesn't exist
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Initialize scaler for mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if fp16 and device.type == "cuda" else None
+    # Check if mixed precision is available and enabled
+    use_fp16 = fp16 and device.type == "cuda" and torch.cuda.is_available()
+    if fp16 and not use_fp16:
+        print("Warning: Mixed precision (fp16) requested but CUDA is not available. Using standard precision instead.")
+    
+    # Initialize scaler for mixed precision training only if available
+    scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
 
     # Initialize checkpoint timing
     last_checkpoint_time = time.time()
@@ -55,8 +60,8 @@ def train(
             labels = batch["labels"].to(device)
 
             # Forward pass with mixed precision if enabled
-            if fp16:
-                with torch.cuda.amp.autocast():
+            if use_fp16:
+                with torch.amp.autocast(device_type=device.type):
                     outputs = model(**inputs, labels=labels)
                     # For diffusion models, loss is already calculated in the forward pass
                     if model_type == "base":
@@ -288,6 +293,19 @@ def main():
         default=None,
         help="Resume training from this checkpoint file",
     )
+    
+    # Performance options
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=2,
+        help="Number of worker threads for data loading",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Pin memory for faster data transfer (only useful with CUDA)"
+    )
 
     args = parser.parse_args()
 
@@ -342,13 +360,20 @@ def main():
         inputs["labels"] = labels
         return inputs
 
+    # Check if CUDA is available for pin_memory and num_workers
+    use_cuda = torch.cuda.is_available()
+    pin_memory = args.pin_memory and use_cuda
+    
+    # Reduce num_workers if not on a machine that can handle it
+    num_workers = args.num_workers if use_cuda else 0
+    
     train_loader = DataLoader(
         dataset["train"],
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=2,  # Add workers for faster data loading
-        pin_memory=True,  # Speed up GPU transfer
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     val_loader = DataLoader(
@@ -356,8 +381,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     # Setup training
