@@ -32,6 +32,9 @@ class ConceptSequenceDataset(Dataset):
             embeddings (torch.Tensor): A tensor of shape (num_embeddings, embedding_dim).
             sequence_length (int): The length of the input sequence to provide to the model.
         """
+        self.embeddings = embeddings.cpu()
+        self.sequence_length = sequence_length
+
         if not isinstance(embeddings, torch.Tensor):
             raise TypeError(
                 f"Embeddings must be a torch.Tensor, got {type(embeddings)}"

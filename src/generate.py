@@ -61,9 +61,7 @@ def parse_args():
         "--noise_level", type=float, default=0.05, help="Noise level for denoising mode"
     )
     parser.add_argument(
-        "--output_text", 
-        action="store_true", 
-        help="Decode the embeddings to text"
+        "--output_text", action="store_true", help="Decode the embeddings to text"
     )
 
     # Model Config (must match the trained model)
@@ -124,7 +122,7 @@ def parse_args():
         "--max_output_length",
         type=int,
         default=100,
-        help="Maximum length of the generated text when decoding embeddings"
+        help="Maximum length of the generated text when decoding embeddings",
     )
 
     return parser.parse_args()
@@ -196,7 +194,9 @@ def generate(args):
     print("Encoding initial sentences...")
     initial_embeddings = encoder.encode(
         input_sentences, lang=args.lang, batch_size=args.encoding_batch_size
-    ).to(device)  # Keep embeddings on the device
+    ).to(
+        device
+    )  # Keep embeddings on the device
 
     if initial_embeddings.shape[0] == 0:
         print("Error: Failed to encode initial sentences.")
@@ -204,7 +204,9 @@ def generate(args):
 
     # --- 3. Perform Generation/Testing ---
     generated_embeddings_list = [initial_embeddings]
-    generated_text_list = input_sentences.copy()  # Store input sentences as initial text
+    generated_text_list = (
+        input_sentences.copy()
+    )  # Store input sentences as initial text
 
     with torch.inference_mode():
         if args.mode == "continuation":
@@ -241,13 +243,13 @@ def generate(args):
             if args.output_text:
                 print("Decoding generated embeddings to text...")
                 decoder = SonarDecoder(device=str(device))
-                
+
                 # Decode each new embedding (not including initial embeddings)
                 for i in range(1, len(generated_embeddings_list)):
                     generated_text = decoder.decode(
-                        generated_embeddings_list[i], 
+                        generated_embeddings_list[i],
                         tgt_lang=args.lang,
-                        max_length=args.max_output_length
+                        max_length=args.max_output_length,
                     )
                     generated_text_list.extend(generated_text)
                     print(f"Generated Step {i} text: {generated_text[0]}")
@@ -269,7 +271,9 @@ def generate(args):
             clean_next_embedding = clean_pred_output[:, -1, :]  # Keep on device
 
             # Predict next step from noisy context
-            noisy_context = add_noise_to_embeddings(context_sequence, args.noise_level).to(device)
+            noisy_context = add_noise_to_embeddings(
+                context_sequence, args.noise_level
+            ).to(device)
             noisy_input_tensor = noisy_context.unsqueeze(0)  # Add batch dim
             noisy_pred_output = model(noisy_input_tensor)
             noisy_next_embedding = noisy_pred_output[:, -1, :]  # Keep on device
@@ -290,34 +294,34 @@ def generate(args):
             print(
                 f"Cosine Similarity between clean/noisy predictions: {similarity.item():.4f}"
             )
-            
+
             # We have the predictions, store them for potential decoding
             generated_embeddings_list = [
                 clean_next_embedding,
                 noisy_next_embedding,
             ]
-            
+
             # Decode to text if requested
             if args.output_text:
                 print("Decoding predicted embeddings to text...")
                 decoder = SonarDecoder(device=str(device))
-                
+
                 # Decode clean prediction
                 clean_text = decoder.decode(
-                    clean_next_embedding, 
+                    clean_next_embedding,
                     tgt_lang=args.lang,
-                    max_length=args.max_output_length
+                    max_length=args.max_output_length,
                 )
                 print(f"Predicted text from CLEAN context: {clean_text[0]}")
-                
+
                 # Decode noisy prediction
                 noisy_text = decoder.decode(
-                    noisy_next_embedding, 
+                    noisy_next_embedding,
                     tgt_lang=args.lang,
-                    max_length=args.max_output_length
+                    max_length=args.max_output_length,
                 )
                 print(f"Predicted text from NOISY context: {noisy_text[0]}")
-                
+
                 generated_text_list.extend(clean_text)
                 generated_text_list.extend(noisy_text)
 
@@ -327,14 +331,20 @@ def generate(args):
 
     if args.mode == "continuation":
         print(f"Generated {args.num_steps} additional concept embeddings.")
-        
+
         if args.output_text:
             print("\nGenerated text sequence:")
             for i, text in enumerate(generated_text_list):
-                prefix = "Input" if i < len(input_sentences) else f"Generated {i - len(input_sentences) + 1}"
+                prefix = (
+                    "Input"
+                    if i < len(input_sentences)
+                    else f"Generated {i - len(input_sentences) + 1}"
+                )
                 print(f"{prefix}: {text}")
         else:
-            print("Initial context embeddings shape:", generated_embeddings_list[0].shape)
+            print(
+                "Initial context embeddings shape:", generated_embeddings_list[0].shape
+            )
             for i in range(1, len(generated_embeddings_list)):
                 print(
                     f"Generated Step {i} embedding shape: {generated_embeddings_list[i].shape}"
@@ -345,13 +355,17 @@ def generate(args):
             # Combine all generated embeddings into a single tensor for potential saving/analysis
             final_embedding_sequence = torch.cat(generated_embeddings_list, dim=0)
             print("Full generated sequence shape:", final_embedding_sequence.shape)
-            print("\nTo see text output instead of embeddings, run with --output_text flag")
+            print(
+                "\nTo see text output instead of embeddings, run with --output_text flag"
+            )
 
     elif args.mode == "denoising":
         if not args.output_text:
             print("Clean prediction shape:", generated_embeddings_list[0].shape)
             print("Noisy prediction shape:", generated_embeddings_list[1].shape)
-            print("\nTo see text output instead of embeddings, run with --output_text flag")
+            print(
+                "\nTo see text output instead of embeddings, run with --output_text flag"
+            )
 
 
 if __name__ == "__main__":

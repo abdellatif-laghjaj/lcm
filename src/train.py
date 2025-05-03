@@ -12,6 +12,8 @@ from datasets import load_dataset, Dataset as HFDataset  # Added HFDataset alias
 from baselcm import BaseLCM, SonarEncoder
 from utils import ConceptSequenceDataset, add_noise_to_embeddings
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 # Set random seed for reproducibility
 torch.manual_seed(42)
 if torch.cuda.is_available():
@@ -49,7 +51,12 @@ def parse_args():
         "--data_sample",
         type=int,
         default=1000,
-        help="Number of samples to select from the dataset (for quick testing)",
+        help="Number of samples to select from the dataset (default: 1000, use 0 for full dataset)",
+    )
+    parser.add_argument(
+        "--full_dataset",
+        action="store_true",
+        help="Use the full dataset instead of sampling",
     )
     parser.add_argument(
         "--sequence_length",
@@ -196,10 +203,14 @@ def train(args):
     # Use streaming=True for very large datasets if memory becomes an issue during loading
     dataset = load_dataset(args.hf_data, split=args.dataset_split)
 
-    # Select a subset if specified
-    if args.data_sample is not None and args.data_sample < len(dataset):
+    # Select a subset if specified and full_dataset flag is not set
+    if args.full_dataset:
+        print(f"Using FULL dataset with {len(dataset)} samples.")
+    elif args.data_sample > 0 and args.data_sample < len(dataset):
         print(f"Selecting {args.data_sample} samples from the dataset.")
         dataset = dataset.select(range(args.data_sample))
+    else:
+        print(f"Using all {len(dataset)} samples from the dataset.")
 
     # Load spacy model for sentence splitting
     print("Loading spacy model for sentence splitting...")
@@ -269,9 +280,9 @@ def train(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=(device.type == "cuda"),  # Keep this for performance
+        persistent_workers=False,  # Change to False
     )
     print(f"Dataset size: {len(train_dataset)} sequences")
 
@@ -292,18 +303,18 @@ def train(args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     criterion = nn.MSELoss()
-    
+
     # Setup mixed precision if requested
     scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
-    
+
     # Optional learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode="min", factor=0.5, patience=2, verbose=True
     )
 
     # --- 5. Training Loop ---
@@ -311,22 +322,22 @@ def train(args):
     for epoch in range(args.epoch):
         model.train()
         running_loss = 0.0
-        
+
         # Wrap dataloader with tqdm for progress bar
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epoch}", leave=True)
-        
+
         # Reset gradient accumulation counter
         grad_accum_counter = 0
         optimizer.zero_grad()
-        
+
         for batch_idx, (input_seq, target_emb) in enumerate(pbar):
-            # Move data to device
-            input_seq = input_seq.to(device, non_blocking=True)
-            target_emb = target_emb.to(device, non_blocking=True)
+            # Explicitly move data to device
+            input_seq = input_seq.to(device)
+            target_emb = target_emb.to(device)
 
             # Add noise to input sequence
             noisy_input_seq = add_noise_to_embeddings(input_seq, args.noise_level)
-            
+
             # Use mixed precision if requested
             if args.mixed_precision:
                 with torch.cuda.amp.autocast():
@@ -334,17 +345,17 @@ def train(args):
                     output_embeddings_seq = model(noisy_input_seq)
                     predicted_next_emb = output_embeddings_seq[:, -1, :]
                     loss = criterion(predicted_next_emb, target_emb)
-                
+
                 # Scale loss and do backward pass
                 scaler.scale(loss / args.grad_accum_steps).backward()
                 grad_accum_counter += 1
-                
+
                 # Update weights if gradient accumulation steps reached
                 if grad_accum_counter == args.grad_accum_steps:
                     # Gradient clipping
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
+
                     # Optimizer step with scaler
                     scaler.step(optimizer)
                     scaler.update()
@@ -354,17 +365,17 @@ def train(args):
                 # Traditional training path without mixed precision
                 output_embeddings_seq = model(noisy_input_seq)
                 predicted_next_emb = output_embeddings_seq[:, -1, :]
-                
+
                 loss = criterion(predicted_next_emb, target_emb)
                 (loss / args.grad_accum_steps).backward()
-                
+
                 grad_accum_counter += 1
-                
+
                 # Update weights if gradient accumulation steps reached
                 if grad_accum_counter == args.grad_accum_steps:
                     # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
+
                     # Optimizer step
                     optimizer.step()
                     optimizer.zero_grad()
@@ -393,21 +404,25 @@ def train(args):
 
         epoch_loss = running_loss / len(train_dataloader)
         print(f"Epoch {epoch+1}/{args.epoch} - Average Loss: {epoch_loss:.4f}")
-        
+
         # Update learning rate scheduler
         scheduler.step(epoch_loss)
 
         if args.wandb:
-            wandb.log({
-                "epoch": epoch + 1, 
-                "loss": epoch_loss,
-                "learning_rate": optimizer.param_groups[0]['lr']
-            })
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "loss": epoch_loss,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
 
         # Save checkpoint if requested
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             os.makedirs(args.save_dir, exist_ok=True)
-            checkpoint_path = os.path.join(args.save_dir, f"base_lcm_checkpoint_epoch_{epoch+1}.pth")
+            checkpoint_path = os.path.join(
+                args.save_dir, f"base_lcm_checkpoint_epoch_{epoch+1}.pth"
+            )
             torch.save(model.state_dict(), checkpoint_path)
             print(f"Checkpoint saved at {checkpoint_path}")
 
