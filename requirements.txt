@@ -1,0 +1,5 @@
+sentencepiece
+spacy 
+wandb 
+tqdm 
+datasets
