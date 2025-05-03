@@ -187,10 +187,16 @@ def train(args):
 
     # Function to split text into sentences
     def split_into_sentences(example):
-        doc = nlp(example[args.text_column])
-        return {
-            "sentences": [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-        }
+        # example[args.text_column] is a list of texts when batched=True
+        texts_batch = example[args.text_column]
+        # Use nlp.pipe for efficient processing of the batch
+        docs = nlp.pipe(texts_batch)
+        # Create a list of lists: outer list corresponds to batch items, inner lists contain sentences for each item
+        batch_sentences = [
+            [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+            for doc in docs
+        ]
+        return {"sentences": batch_sentences}
 
     # Split texts into sentences - Use map for efficiency
     print("Splitting corpus into sentences...")
