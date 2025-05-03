@@ -7,10 +7,19 @@ from transformers import AutoTokenizer
 import wandb
 from tqdm import tqdm
 import numpy as np
-from model import LCM
+import argparse
+from model import LCM, DiffusionLCM, TwoTowerDiffusionLCM
 
 
-def train(model, train_loader, val_loader, optimizer, criterion, num_epochs=5):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    criterion,
+    num_epochs=5,
+    model_type="base",
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     best_val_loss = float("inf")
@@ -27,8 +36,13 @@ def train(model, train_loader, val_loader, optimizer, criterion, num_epochs=5):
 
             # Forward pass
             optimizer.zero_grad()
-            outputs = model(**inputs)
-            loss = criterion(outputs[0], labels)
+            outputs = model(**inputs, labels=labels)
+
+            # For diffusion models, loss is already calculated in the forward pass
+            if model_type == "base":
+                loss = criterion(outputs[0], labels)
+            else:
+                loss = outputs[1]  # Loss is second output for diffusion models
 
             # Backward pass
             loss.backward()
@@ -49,8 +63,14 @@ def train(model, train_loader, val_loader, optimizer, criterion, num_epochs=5):
             for batch in tqdm(val_loader, desc="Validation"):
                 inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
                 labels = batch["labels"].to(device)
-                outputs = model(**inputs)
-                loss = criterion(outputs[0], labels)
+
+                if model_type == "base":
+                    outputs = model(**inputs, labels=labels)
+                    loss = criterion(outputs[0], labels)
+                else:
+                    outputs = model(**inputs, labels=labels)
+                    loss = outputs[1]  # Loss is second output for diffusion models
+
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
@@ -63,21 +83,80 @@ def train(model, train_loader, val_loader, optimizer, criterion, num_epochs=5):
         # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "final_model.pt")
+            torch.save(model.state_dict(), f"{model_type}_model.pt")
             print(f"Saved new best model with validation loss: {best_val_loss:.4f}")
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Train a Large Concept Model")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="base",
+        choices=["base", "diffusion", "two_tower"],
+        help="Type of LCM model to train",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=8, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=5, help="Number of epochs to train"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=5e-5, help="Learning rate"
+    )
+    parser.add_argument(
+        "--diffusion_steps",
+        type=int,
+        default=10,
+        help="Number of diffusion steps (only for diffusion models)",
+    )
+    parser.add_argument(
+        "--encoder_model",
+        type=str,
+        default="sentence-transformers/all-mpnet-base-v2",
+        help="Pretrained encoder model to use",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cnn_dailymail",
+        help="Dataset to use for training",
+    )
+    parser.add_argument(
+        "--dataset_version",
+        type=str,
+        default="3.0.0",
+        help="Version of the dataset",
+    )
+    args = parser.parse_args()
+
     # Initialize wandb
-    wandb.init(project="lcm-practical", name="training-run")
+    wandb.init(
+        project="lcm-practical",
+        name=f"{args.model_type}-lcm-training",
+        config=vars(args),
+    )
 
     # Load dataset
-    print("Loading dataset...")
-    dataset = load_dataset("cnn_dailymail", "3.0.0")
+    print(f"Loading dataset {args.dataset}...")
+    dataset = load_dataset(args.dataset, args.dataset_version)
 
-    # Initialize model and tokenizer
-    model = LCM()
-    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-mpnet-base-v2")
+    # Initialize model based on type
+    print(f"Initializing {args.model_type.upper()}-LCM model...")
+    if args.model_type == "base":
+        model = LCM(encoder_model=args.encoder_model)
+    elif args.model_type == "diffusion":
+        model = DiffusionLCM(
+            encoder_model=args.encoder_model, diffusion_steps=args.diffusion_steps
+        )
+    elif args.model_type == "two_tower":
+        model = TwoTowerDiffusionLCM(
+            encoder_model=args.encoder_model, diffusion_steps=args.diffusion_steps
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(args.encoder_model)
 
     # Prepare data loaders
     def collate_fn(batch):
@@ -98,20 +177,36 @@ def main():
         return inputs
 
     train_loader = DataLoader(
-        dataset["train"], batch_size=8, shuffle=True, collate_fn=collate_fn
+        dataset["train"],
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
-        dataset["validation"], batch_size=8, shuffle=False, collate_fn=collate_fn
+        dataset["validation"],
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
     )
 
     # Setup training
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+    criterion = (
+        nn.MSELoss() if args.model_type == "base" else None
+    )  # Diffusion models handle loss internally
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     # Train
     print("Starting training...")
-    train(model, train_loader, val_loader, optimizer, criterion)
+    train(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        criterion,
+        num_epochs=args.epochs,
+        model_type=args.model_type,
+    )
 
     wandb.finish()
 
