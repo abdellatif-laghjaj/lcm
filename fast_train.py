@@ -32,7 +32,6 @@ if __name__ == "__main__":
         "10",  # Save checkpoints every 10 minutes
         "--warmup_steps",
         "100",  # Shorter warmup
-
         # Disable wandb by default to avoid prompts
         "--wandb_mode",
         "disabled",  # Disable wandb by default
@@ -40,21 +39,18 @@ if __name__ == "__main__":
 
     # Add CUDA-specific optimizations only if available
     if cuda_available:
-        cmd.extend([
-            "--fp16",  # Only use mixed precision with CUDA
-            "--pin_memory",  # Only use pin_memory with CUDA
-            "--num_workers",
-            "2"  # Use dataloader workers with CUDA
-        ])
+        cmd.extend(
+            [
+                "--fp16",  # Only use mixed precision with CUDA
+                "--pin_memory",  # Only use pin_memory with CUDA
+                "--num_workers",
+                "2",  # Use dataloader workers with CUDA
+            ]
+        )
     else:
         print("CUDA is not available, running in CPU-only mode (slower)")
         # Reduce batch size further for CPU-only mode
-        cmd.extend([
-            "--batch_size",
-            "2",
-            "--gradient_accumulation_steps",
-            "16"
-        ])
+        cmd.extend(["--batch_size", "2", "--gradient_accumulation_steps", "16"])
 
     # Add any additional arguments from command line
     cmd.extend(sys.argv[1:])
