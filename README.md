@@ -73,21 +73,22 @@ Our implementation consists of three main components:
 
 Key hyperparameters used in our experiments:
 
-| Parameter | Value |
-|-----------|-------|
-| Learning Rate | 5e-5 |
-| Batch Size | 32 |
-| Warmup Steps | 1000 |
-| Max Steps | 50000 |
-| Weight Decay | 0.01 |
-| Concept Dimension | 768 |
-| Transformer Layers | 4 |
-| Attention Heads | 8 |
-| α (Hybrid Attention) | 0.7 |
+| Parameter            | Value |
+| -------------------- | ----- |
+| Learning Rate        | 5e-5  |
+| Batch Size           | 32    |
+| Warmup Steps         | 1000  |
+| Max Steps            | 50000 |
+| Weight Decay         | 0.01  |
+| Concept Dimension    | 768   |
+| Transformer Layers   | 4     |
+| Attention Heads      | 8     |
+| α (Hybrid Attention) | 0.7   |
 
 ## Results
 
 Our model achieves:
+
 - 82% ROUGE-L retention compared to BART
 - 0.82 concept cluster purity
 - 4% average performance drop in multilingual settings
