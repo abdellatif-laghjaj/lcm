@@ -34,10 +34,16 @@ def parse_args():
 
     # Data parameters
     parser.add_argument(
-        "--test_data", type=str, help="Path to test data or dataset name"
+        "--dataset",
+        type=str,
+        default="wikitext",
+        help="Dataset name: wikitext, bookcorpus, or custom",
     )
     parser.add_argument(
-        "--test_data_config", type=str, help="Configuration for the test dataset"
+        "--dataset_config",
+        type=str,
+        default="wikitext-103-v1",
+        help="Configuration for the dataset",
     )
     parser.add_argument(
         "--text_column", type=str, default="text", help="Text column in the dataset"
@@ -53,6 +59,11 @@ def parse_args():
     )
     parser.add_argument(
         "--use_sentences", action="store_true", help="Split text into sentences"
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Trust remote code for dataset loading",
     )
 
     # Inference parameters
@@ -147,19 +158,47 @@ def test_on_dataset(model, encoder, args):
 
     # Load dataset
     try:
-        if args.test_data_config:
-            dataset = load_dataset(args.test_data, args.test_data_config, split="test")
+        # Handle different datasets
+        if args.dataset.lower() == "wikitext":
+            # WikiText is a reliable dataset that works well without trust_remote_code
+            dataset_name = "wikitext" if args.dataset_config else "wikitext-103-v1"
+            dataset = load_dataset(dataset_name, args.dataset_config, split="test")
+
+        elif args.dataset.lower() == "bookcorpus":
+            # BookCorpus is another good alternative
+            dataset = load_dataset("bookcorpus", split="train")
+
+        elif args.dataset.lower() == "oscar":
+            # Only use oscar if trust_remote_code is explicitly set
+            if not args.trust_remote_code:
+                raise ValueError("Oscar dataset requires trust_remote_code=True")
+            dataset = load_dataset(
+                args.dataset,
+                args.dataset_config,
+                split="test",
+                trust_remote_code=True,
+            )
+
         else:
-            dataset = load_dataset(args.test_data, split="test")
+            # Try to load the dataset as specified
+            if args.trust_remote_code:
+                dataset = load_dataset(
+                    args.dataset,
+                    args.dataset_config,
+                    split="test",
+                    trust_remote_code=True,
+                )
+            else:
+                dataset = load_dataset(args.dataset, args.dataset_config, split="test")
 
         dataset = dataset.select(range(min(args.data_sample, len(dataset))))
-        print(f"Loaded {len(dataset)} samples from {args.test_data}")
+        print(f"Loaded {len(dataset)} samples from {args.dataset}")
 
     except Exception as e:
         print(f"Error loading dataset: {e}")
-        print("Using a fallback dataset...")
+        print("Using WikiText-103 as fallback dataset...")
         dataset = load_dataset(
-            "oscar", "unshuffled_deduplicated_en", split="train"
+            "wikitext", "wikitext-103-v1", split="test"
         ).select(range(args.data_sample))
 
     # Process texts
@@ -178,11 +217,26 @@ def test_on_dataset(model, encoder, args):
 
         processed_texts = []
         for text in tqdm(texts, desc="Processing Texts"):
-            doc = nlp(text)
-            sentences = [sent.text for sent in doc.sents]
-            processed_texts.extend(sentences)
+            if not text or not isinstance(text, str):
+                continue
+            try:
+                doc = nlp(text)
+                sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+                if sentences:  # Only add non-empty sentences
+                    processed_texts.extend(sentences)
+            except Exception as e:
+                print(f"Error processing text: {e}")
 
         texts = processed_texts
+
+        # Ensure we have enough data
+        if len(texts) < 10:
+            print("Warning: Not enough sentences extracted. Using raw texts instead.")
+            texts = [
+                text
+                for text in dataset[args.text_column]
+                if isinstance(text, str) and text.strip()
+            ]
 
     print(f"Processing {len(texts)} texts...")
 
@@ -376,7 +430,7 @@ def main():
     encoder = SonarEncoder(device=args.device)
 
     # Test on dataset if specified
-    if args.test_data:
+    if args.dataset:
         test_on_dataset(model, encoder, args)
 
     # Run inference if input text is provided
@@ -384,13 +438,13 @@ def main():
         run_inference(model, encoder, args)
 
     # If neither test data nor input text is provided
-    if not args.test_data and not args.input_text:
+    if not args.dataset and not args.input_text:
         print(
-            "No test data or input text provided. Please specify --test_data or --input_text"
+            "No dataset or input text provided. Please specify --dataset or --input_text"
         )
         print("Example usage:")
         print(
-            "  Testing: python test.py --model_path saved_models/base_lcm_model_best.pth --test_data oscar --data_sample 100"
+            "  Testing: python test.py --model_path saved_models/base_lcm_model_best.pth --dataset wikitext --data_sample 100"
         )
         print(
             "  Inference: python test.py --model_path saved_models/base_lcm_model_best.pth --input_text 'This is a test sentence.'"

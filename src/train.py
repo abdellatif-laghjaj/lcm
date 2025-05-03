@@ -87,13 +87,10 @@ def parse_args():
 
     # Data parameters
     parser.add_argument(
-        "--hf_data", type=str, default="oscar", help="Hugging Face dataset name"
+        "--dataset", type=str, default="wikitext", help="Dataset name: wikitext, bookcorpus, or custom"
     )
     parser.add_argument(
-        "--hf_config",
-        type=str,
-        default="unshuffled_deduplicated_en",
-        help="Configuration for the Hugging Face dataset",
+        "--dataset_config", type=str, default="wikitext-103-v1", help="Configuration for the dataset"
     )
     parser.add_argument(
         "--text_column", type=str, default="text", help="Text column in the dataset"
@@ -106,6 +103,9 @@ def parse_args():
         type=int,
         default=1000,
         help="Number of samples to use from the dataset",
+    )
+    parser.add_argument(
+        "--trust_remote_code", action="store_true", help="Trust remote code for dataset loading"
     )
 
     # Other parameters
@@ -279,22 +279,52 @@ def train(args):
     encoder = SonarEncoder(device=device)
 
     # Load dataset
-    print(f"Loading dataset: {args.hf_data}")
+    print(f"Loading dataset: {args.dataset}")
     try:
-        if args.hf_config:
-            df = load_dataset(args.hf_data, args.hf_config, split="train").select(
-                range(args.data_sample)
+        # Handle different datasets
+        if args.dataset.lower() == "wikitext":
+            # WikiText is a reliable dataset that works well without trust_remote_code
+            dataset_name = "wikitext" if args.dataset_config else "wikitext-103-v1"
+            df = load_dataset(dataset_name, args.dataset_config, split="train")
+            if args.data_sample > 0 and args.data_sample < len(df):
+                df = df.select(range(args.data_sample))
+
+        elif args.dataset.lower() == "bookcorpus":
+            # BookCorpus is another good alternative
+            df = load_dataset("bookcorpus", split="train")
+            if args.data_sample > 0 and args.data_sample < len(df):
+                df = df.select(range(args.data_sample))
+
+        elif args.dataset.lower() == "oscar":
+            # Only use oscar if trust_remote_code is explicitly set
+            if not args.trust_remote_code:
+                raise ValueError("Oscar dataset requires trust_remote_code=True")
+            df = load_dataset(
+                args.dataset, args.dataset_config, split="train", trust_remote_code=True
             )
+            if args.data_sample > 0 and args.data_sample < len(df):
+                df = df.select(range(args.data_sample))
+
         else:
-            df = load_dataset(args.hf_data, split="train").select(
-                range(args.data_sample)
-            )
+            # Try to load the dataset as specified
+            if args.trust_remote_code:
+                df = load_dataset(
+                    args.dataset, args.dataset_config, split="train", trust_remote_code=True
+                )
+            else:
+                df = load_dataset(args.dataset, args.dataset_config, split="train")
+
+            if args.data_sample > 0 and args.data_sample < len(df):
+                df = df.select(range(args.data_sample))
+
     except Exception as e:
         print(f"Error loading dataset: {e}")
-        print("Using a fallback dataset...")
-        df = load_dataset("oscar", "unshuffled_deduplicated_en", split="train").select(
-            range(args.data_sample)
-        )
+        print("Using WikiText-103 as fallback dataset...")
+        df = load_dataset("wikitext", "wikitext-103-v1", split="train")
+        if args.data_sample > 0 and args.data_sample < len(df):
+            df = df.select(range(args.data_sample))
+
+    print(f"Successfully loaded dataset with {len(df)} examples")
 
     # Split text into sentences
     print("Splitting text into sentences...")
@@ -309,15 +339,31 @@ def train(args):
 
     # Function to split text into sentences
     def split_into_sentences(text):
-        doc = nlp(text)
-        return [sent.text for sent in doc.sents]
+        if not text or not isinstance(text, str):
+            return []
+        try:
+            doc = nlp(text)
+            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+            return sentences
+        except Exception as e:
+            print(f"Error processing text: {e}")
+            return []
 
     processed_texts = []
     for text in tqdm(df[args.text_column], desc="Processing Texts"):
         sentences = split_into_sentences(text)
-        processed_texts.extend(sentences)
+        if sentences:  # Only add non-empty sentences
+            processed_texts.extend(sentences)
 
     print(f"Number of sentences: {len(processed_texts)}")
+
+    # Ensure we have enough data
+    if len(processed_texts) < 100:
+        print("Warning: Not enough sentences extracted. Using raw texts instead.")
+        processed_texts = [
+            text for text in df[args.text_column] if isinstance(text, str) and text.strip()
+        ]
+        print(f"Number of raw texts: {len(processed_texts)}")
 
     # Encode the processed sentences
     print("Encoding sentences...")
