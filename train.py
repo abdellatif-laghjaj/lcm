@@ -28,6 +28,7 @@ def train(
     max_val_samples=None,
     fp16=False,
     clip_grad_norm=1.0,
+    use_wandb=True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -122,7 +123,7 @@ def train(
             train_bar.set_postfix({"loss": full_loss})
 
             # Log to wandb periodically to reduce overhead
-            if i % 10 == 0:
+            if use_wandb and i % 10 == 0:
                 wandb.log(
                     {
                         "train_loss": full_loss,
@@ -189,13 +190,14 @@ def train(
 
         val_size = len(val_dataset) if max_val_samples else len(val_loader)
         avg_val_loss = val_loss / val_size
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train_loss_epoch": avg_train_loss,
-                "val_loss_epoch": avg_val_loss,
-            }
-        )
+        if use_wandb:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss_epoch": avg_train_loss,
+                    "val_loss_epoch": avg_val_loss,
+                }
+            )
 
         print(f"\nEpoch {epoch+1}:")
         print(f"Average training loss: {avg_train_loss:.4f}")
@@ -335,14 +337,54 @@ def main():
         help="Pin memory for faster data transfer (only useful with CUDA)",
     )
 
+    # Wandb configuration
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        default=False,
+        help="Whether to use Weights & Biases for logging",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="disabled",
+        choices=["online", "offline", "disabled"],
+        help="Weights & Biases mode (online, offline, disabled)",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="lcm-practical",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Weights & Biases entity name (username or team name)",
+    )
+    parser.add_argument(
+        "--wandb_name",
+        type=str,
+        default=None,
+        help="Weights & Biases run name",
+    )
+
     args = parser.parse_args()
 
-    # Initialize wandb
-    wandb.init(
-        project="lcm-practical",
-        name=f"{args.model_type}-lcm-training",
-        config=vars(args),
-    )
+    # Initialize wandb if enabled
+    use_wandb = args.use_wandb
+    if use_wandb:
+        run_name = args.wandb_name or f"{args.model_type}-lcm-training"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=vars(args),
+            mode=args.wandb_mode,
+        )
+    else:
+        print("Weights & Biases logging is disabled")
 
     # Load dataset
     print(f"Loading dataset {args.dataset}...")
@@ -463,9 +505,11 @@ def main():
         max_val_samples=args.max_val_samples,
         fp16=args.fp16,
         clip_grad_norm=args.clip_grad_norm,
+        use_wandb=use_wandb,
     )
 
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
