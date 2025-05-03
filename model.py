@@ -216,19 +216,22 @@ class DiffusionLCM(nn.Module):
     Implementation of a diffusion-based Large Concept Model (LCM) based on Meta's One-Tower architecture.
     This model uses a diffusion process to iteratively refine concept predictions.
     """
-    def __init__(self, 
-                 encoder_model: str = "sentence-transformers/all-mpnet-base-v2",
-                 hidden_size: int = 768,
-                 num_layers: int = 6,  # Increased from 4 to 6 for better performance
-                 num_heads: int = 8,
-                 dropout: float = 0.1,
-                 diffusion_steps: int = 10):
+
+    def __init__(
+        self,
+        encoder_model: str = "sentence-transformers/all-mpnet-base-v2",
+        hidden_size: int = 768,
+        num_layers: int = 6,  # Increased from 4 to 6 for better performance
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        diffusion_steps: int = 10,
+    ):
         super().__init__()
-        
+
         # Initialize sentence encoder
         self.encoder = AutoModel.from_pretrained(encoder_model)
         self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
-        
+
         # Concept transformer layers
         self.concept_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -236,87 +239,91 @@ class DiffusionLCM(nn.Module):
                 nhead=num_heads,
                 dim_feedforward=hidden_size * 4,
                 dropout=dropout,
-                batch_first=True
+                batch_first=True,
             ),
-            num_layers=num_layers
+            num_layers=num_layers,
         )
-        
+
         # Projection layers
         self.input_projection = nn.Linear(hidden_size, hidden_size)
         self.output_projection = nn.Linear(hidden_size, hidden_size)
-        
+
         # Layer normalization
         self.norm = nn.LayerNorm(hidden_size)
-        
+
         # Diffusion parameters
         self.diffusion_steps = diffusion_steps
-        self.register_buffer('betas', torch.linspace(0.0001, 0.02, diffusion_steps))
-        self.register_buffer('alphas', 1.0 - self.betas)
-        self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, 0))
-        
+        self.register_buffer("betas", torch.linspace(0.0001, 0.02, diffusion_steps))
+        self.register_buffer("alphas", 1.0 - self.betas)
+        self.register_buffer("alphas_cumprod", torch.cumprod(self.alphas, 0))
+
         # Noise prediction network
         self.noise_pred_net = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size * 2),
             nn.GELU(),
-            nn.Linear(hidden_size * 2, hidden_size)
+            nn.Linear(hidden_size * 2, hidden_size),
         )
-        
+
         # Geometric regularization
         self.lambda_reg = 0.1
-    
+
     def _get_attention_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Create attention mask from input_ids."""
         return (input_ids != self.tokenizer.pad_token_id).float()
-    
-    def _pool_embeddings(self, 
-                        embeddings: torch.Tensor, 
-                        attention_mask: torch.Tensor) -> torch.Tensor:
+
+    def _pool_embeddings(
+        self, embeddings: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
         """Pool token embeddings to sentence embeddings using attention mask."""
         # Sum embeddings
         masked_embeddings = embeddings * attention_mask.unsqueeze(-1)
         summed = torch.sum(masked_embeddings, dim=1)
-        
+
         # Get counts for averaging
         counts = torch.clamp(torch.sum(attention_mask, dim=1, keepdim=True), min=1e-9)
-        
+
         # Average
         pooled = summed / counts
         return pooled
-    
-    def add_noise(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def add_noise(
+        self, x: torch.Tensor, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise to concept embeddings according to diffusion schedule."""
         device = x.device
-        
+
         # Move t to the same device as x if needed
         t = t.to(device)
-        
+
         # Time-dependent factor
         a = self.alphas_cumprod[t].to(device)
         if a.dim() == 0:
             a = a.unsqueeze(0)
         a = a.unsqueeze(1)  # Add dimensions for proper broadcasting
-        
+
         # Sample noise
         noise = torch.randn_like(x)
-        
+
         # Noisy sample: x_t = √α_t * x_0 + √(1 - α_t) * ϵ
         x_noisy = torch.sqrt(a) * x + torch.sqrt(1 - a) * noise
-        
+
         return x_noisy, noise
-    
-    def predict_noise(self, x_noisy: torch.Tensor, timestep: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+
+    def predict_noise(
+        self, x_noisy: torch.Tensor, timestep: torch.Tensor, context: torch.Tensor
+    ) -> torch.Tensor:
         """Predict noise in noisy concept embedding."""
         # Ensure timestep is on the correct device
         timestep = timestep.to(x_noisy.device)
-        
+
         # Combine noisy concepts with context (input concepts)
         combined = torch.cat([x_noisy, context], dim=-1)
-        
+
         # Predict noise
         predicted_noise = self.noise_pred_net(combined)
-        
+
         return predicted_noise
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,

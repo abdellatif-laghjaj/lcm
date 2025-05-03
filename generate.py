@@ -4,10 +4,14 @@ import nltk
 import os
 import argparse
 from transformers import AutoModel, AutoTokenizer
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import numpy as np
 from tqdm import tqdm
 from model import LCM, DiffusionLCM, TwoTowerDiffusionLCM
+from datasets import load_dataset
+from rouge_score import rouge_scorer
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
 class ConceptRetriever:
@@ -18,8 +22,11 @@ class ConceptRetriever:
         encoder_model: str = "sentence-transformers/all-mpnet-base-v2",
         diffusion_steps: int = 10,
         batch_size: int = 8,
+        device: str = None,
     ):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         self.batch_size = batch_size
         self.model_type = model_type
 
@@ -47,7 +54,17 @@ class ConceptRetriever:
             )
 
         # Load model weights
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        try:
+            # Try loading state dict directly first
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        except:
+            # If that fails, try loading from a checkpoint dictionary
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if "model_state_dict" in checkpoint:
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                raise ValueError(f"Could not load model from {model_path}")
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -208,6 +225,100 @@ class ConceptRetriever:
             print(f"Error in direct generation: {str(e)}")
             return ""
 
+    def evaluate(
+        self, dataset, num_samples=10, method="generation", diffusion_steps=None
+    ):
+        """Evaluate the model on a dataset and compute ROUGE scores."""
+        if num_samples > len(dataset):
+            num_samples = len(dataset)
+
+        # Sample a subset of data for evaluation
+        indices = np.random.choice(len(dataset), num_samples, replace=False)
+
+        rouge = rouge_scorer.RougeScorer(
+            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
+        )
+        results = []
+
+        for i in tqdm(indices, desc="Evaluating"):
+            example = dataset[i]
+            article = example["article"]
+            reference = example["highlights"]
+
+            if method == "retrieval":
+                # Build index from the article
+                self.build_index([article])
+                prediction = self.generate_summary(article, num_sentences=3)
+            else:
+                # Direct generation
+                prediction = self.direct_generation(
+                    article, max_length=128, diffusion_steps=diffusion_steps
+                )
+
+            # Calculate ROUGE scores
+            scores = rouge.score(reference, prediction)
+
+            results.append(
+                {
+                    "article": article[:100]
+                    + "...",  # Truncate long articles for display
+                    "reference": reference,
+                    "prediction": prediction,
+                    "rouge1": scores["rouge1"].fmeasure,
+                    "rouge2": scores["rouge2"].fmeasure,
+                    "rougeL": scores["rougeL"].fmeasure,
+                }
+            )
+
+        # Calculate average scores
+        avg_rouge1 = np.mean([r["rouge1"] for r in results])
+        avg_rouge2 = np.mean([r["rouge2"] for r in results])
+        avg_rougeL = np.mean([r["rougeL"] for r in results])
+
+        print(f"\nAverage ROUGE Scores ({method}):")
+        print(f"ROUGE-1: {avg_rouge1:.4f}")
+        print(f"ROUGE-2: {avg_rouge2:.4f}")
+        print(f"ROUGE-L: {avg_rougeL:.4f}")
+
+        return results
+
+    def visualize_results(self, results, method="generation"):
+        """Visualize the evaluation results."""
+        # Convert results to DataFrame for easier manipulation
+        df = pd.DataFrame(results)
+
+        # Create bar chart of ROUGE scores
+        plt.figure(figsize=(10, 6))
+        avg_scores = [df["rouge1"].mean(), df["rouge2"].mean(), df["rougeL"].mean()]
+        plt.bar(
+            ["ROUGE-1", "ROUGE-2", "ROUGE-L"],
+            avg_scores,
+            color=["blue", "green", "red"],
+        )
+        plt.title(f"Average ROUGE Scores ({method.capitalize()} Method)")
+        plt.ylabel("F-measure")
+        plt.ylim(0, 1)
+
+        # Add score values on top of bars
+        for i, score in enumerate(avg_scores):
+            plt.text(i, score + 0.05, f"{score:.4f}", ha="center")
+
+        plt.tight_layout()
+        plt.savefig(f"{self.model_type}_lcm_{method}_scores.png")
+        print(
+            f"Scores visualization saved to {self.model_type}_lcm_{method}_scores.png"
+        )
+
+        # Create a summary table
+        print("\nSample Results:")
+        for i in range(min(3, len(results))):
+            print(f"\nExample {i+1}:")
+            print(f"Reference: {results[i]['reference']}")
+            print(f"Prediction: {results[i]['prediction']}")
+            print(
+                f"ROUGE-1: {results[i]['rouge1']:.4f}, ROUGE-2: {results[i]['rouge2']:.4f}, ROUGE-L: {results[i]['rougeL']:.4f}"
+            )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -216,7 +327,7 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="base_model.pt",
+        default="checkpoints/base_model.pt",
         help="Path to the trained model",
     )
     parser.add_argument(
@@ -235,9 +346,9 @@ def main():
     parser.add_argument(
         "--method",
         type=str,
-        default="retrieval",
-        choices=["retrieval", "generation"],
-        help="Method to use for generating summaries",
+        default="generation",
+        choices=["retrieval", "generation", "evaluate"],
+        help="Method to use for generating summaries or evaluation",
     )
     parser.add_argument(
         "--diffusion_steps",
@@ -251,6 +362,15 @@ def main():
         default=1.0,
         help="Temperature for retrieval sampling",
     )
+    parser.add_argument(
+        "--num_samples", type=int, default=10, help="Number of samples to evaluate"
+    )
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device to use (cuda, cpu)"
+    )
+    parser.add_argument(
+        "--visualize", action="store_true", help="Visualize evaluation results"
+    )
     args = parser.parse_args()
 
     # Initialize model
@@ -259,26 +379,27 @@ def main():
         model_type=args.model_type,
         encoder_model=args.encoder_model,
         diffusion_steps=args.diffusion_steps,
+        device=args.device,
     )
 
-    # Example articles
-    articles = [
-        "The quick brown fox jumps over the lazy dog. This is a test sentence. Another test sentence here.",
-        "Different article with some content. More sentences here. Final test sentence.",
+    # Example articles for simple testing
+    news_articles = [
+        "Scientists have discovered a new species of deep-sea fish that can survive at extreme depths. The fish has special adaptations including pressure-resistant cells and unique enzyme systems. Researchers believe this discovery could help develop new medical treatments for high blood pressure and other conditions.",
+        "The city council voted yesterday to approve the new urban development plan. The plan includes affordable housing units, green spaces, and improved public transportation options. Local residents expressed mixed reactions, with some praising the focus on sustainability while others expressed concerns about potential increases in traffic congestion.",
     ]
 
     if args.method == "retrieval":
         # Build index
-        retriever.build_index(articles)
+        retriever.build_index(news_articles)
 
         # Generate summary using retrieval
-        test_article = "Test article about a fox and a dog."
+        test_article = "A team of marine biologists has found new fish species in the deep ocean trenches. These fish have unusual adaptations."
         summary = retriever.generate_summary(test_article, temperature=args.temperature)
         print(f"\nGenerated summary (retrieval): {summary}")
 
-    else:  # generation
+    elif args.method == "generation":
         # Generate summary using direct generation
-        test_article = "Test article about a fox and a dog."
+        test_article = "A team of marine biologists has found new fish species in the deep ocean trenches. These fish have unusual adaptations."
         summary = retriever.direct_generation(
             test_article,
             diffusion_steps=(
@@ -286,6 +407,31 @@ def main():
             ),
         )
         print(f"\nGenerated summary (direct): {summary}")
+
+    elif args.method == "evaluate":
+        # Load dataset for evaluation
+        print("Loading dataset for evaluation...")
+        dataset = load_dataset("cnn_dailymail", "3.0.0")["test"]
+
+        # Run evaluation
+        print(
+            f"Evaluating model using {args.method} method on {args.num_samples} samples..."
+        )
+        results = retriever.evaluate(
+            dataset,
+            num_samples=args.num_samples,
+            method="generation",
+            diffusion_steps=(
+                args.diffusion_steps // 2 if args.model_type != "base" else None
+            ),
+        )
+
+        # Visualize results if requested
+        if args.visualize:
+            try:
+                retriever.visualize_results(results, method="generation")
+            except Exception as e:
+                print(f"Error visualizing results: {str(e)}")
 
 
 if __name__ == "__main__":
