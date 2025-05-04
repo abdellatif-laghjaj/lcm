@@ -240,7 +240,9 @@ class ConceptRetriever:
         )
         results = []
 
-        for i in tqdm(indices, desc="Evaluating"):
+        for idx in tqdm(indices, desc="Evaluating"):
+            # Convert numpy.int64 to regular Python int to avoid indexing issues
+            i = int(idx)
             example = dataset[i]
             article = example["article"]
             reference = example["highlights"]
