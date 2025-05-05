@@ -10,6 +10,7 @@ from sonar.inference_pipelines.text import (
 import spacy
 from sklearn.preprocessing import RobustScaler
 from datasets import load_dataset
+import subprocess
 
 # Project Structure Setup
 os.makedirs("large_concept_model/data/raw", exist_ok=True)
@@ -20,9 +21,6 @@ os.makedirs("large_concept_model/training", exist_ok=True)
 os.makedirs("large_concept_model/inference", exist_ok=True)
 os.makedirs("large_concept_model/evaluation", exist_ok=True)
 os.makedirs("large_concept_model/notebooks", exist_ok=True)
-
-# Set device to GPU by default if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # SONAR Utilities
@@ -122,9 +120,51 @@ class EmbeddingDataset(Dataset):
 
 # Data Preparation with Hugging Face Datasets
 def segment_sentences(text, lang="en"):
-    nlp = spacy.load(f"{lang}_core_web_sm")
-    doc = nlp(text)
-    return [sent.text for sent in doc.sents]
+    """
+    Segment text into sentences using SpaCy.
+
+    Args:
+        text (str): Text to segment
+        lang (str): Language code for SpaCy (en, de, fr, etc.)
+    """
+    try:
+        # Map language codes to SpaCy model names
+        lang_mapping = {
+            "eng": "en",
+            "fra": "fr",
+            "deu": "de",
+            "spa": "es",
+            "ita": "it",
+            # Add more mappings as needed
+        }
+
+        # Get the first part of the language code (before underscore)
+        if "_" in lang:
+            lang_base = lang.split("_")[0]
+        else:
+            lang_base = lang
+
+        # Map to SpaCy language code
+        spacy_lang = lang_mapping.get(lang_base, lang_base)
+
+        # Try to load the SpaCy model
+        try:
+            model_name = f"{spacy_lang}_core_web_sm"
+            nlp = spacy.load(model_name)
+        except OSError:
+            # If model not found, download it first
+            print(f"Downloading {model_name}...")
+            subprocess.run(
+                ["python", "-m", "spacy", "download", model_name], check=True
+            )
+            nlp = spacy.load(model_name)
+
+        doc = nlp(text)
+        return [sent.text for sent in doc.sents]
+    except Exception as e:
+        print(f"Error in sentence segmentation: {e}")
+        # Fallback to simple splitting by periods
+        return [s.strip() + "." for s in text.split(".") if s.strip()]
 
 
 def prepare_data(
@@ -134,7 +174,7 @@ def prepare_data(
     text_column="text",
     lang="eng_Latn",
     output_file="large_concept_model/data/processed/embeddings.npy",
-    device="cpu",
+    device=None,
     batch_size=1000,
 ):
     """
@@ -142,13 +182,31 @@ def prepare_data(
 
     Args:
         dataset_name (str): Name of the dataset on Hugging Face (e.g., 'wikitext').
+        config_name (str): Name of the dataset configuration (e.g., 'wikitext-103-raw-v1').
         split (str): Dataset split to use (e.g., 'train', 'test').
         text_column (str): Name of the column containing text data.
         lang (str): Language code for SONAR (e.g., 'eng_Latn').
         output_file (str): Path to save the embeddings.
-        device (str): Device to run SONAR encoding on ('cpu' or 'cuda').
+        device: Device to run encoding on (torch.device or str).
         batch_size (int): Number of texts to process per batch.
     """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    # Get base language for SpaCy
+    spacy_lang = "en"  # Default to English
+    if "_" in lang:
+        lang_base = lang.split("_")[0]
+        # Map common language codes
+        if lang_base == "eng":
+            spacy_lang = "en"
+        elif lang_base == "fra":
+            spacy_lang = "fr"
+
+    print(f"Loading dataset: {dataset_name}, config: {config_name}, split: {split}")
+
     # Load dataset from Hugging Face
     try:
         dataset = load_dataset(dataset_name, config_name, split=split)
@@ -163,12 +221,11 @@ def prepare_data(
 
     # Process texts in batches for efficiency
     for i in range(0, len(texts), batch_size):
+        print(f"Processing batch {i//batch_size + 1}/{(len(texts)//batch_size) + 1}")
         batch_texts = texts[i : i + batch_size]
         # Segment sentences using SpaCy
         sentences = [
-            sent
-            for text in batch_texts
-            for sent in segment_sentences(text, lang.split("_")[0])
+            sent for text in batch_texts for sent in segment_sentences(text, spacy_lang)
         ]
         sentences.append("End of text.")  # Marker for end of sequence
         # Encode sentences into SONAR embeddings
@@ -182,8 +239,14 @@ def prepare_data(
 
 # Training
 def train(model, dataloader, epochs=10, lr=1e-4, device="cuda"):
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    print(f"Training on {device} for {epochs} epochs")
     for epoch in range(epochs):
         total_loss = 0
         for src, tgt in dataloader:
@@ -194,36 +257,72 @@ def train(model, dataloader, epochs=10, lr=1e-4, device="cuda"):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}, Loss: {total_loss / len(dataloader)}")
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(dataloader):.6f}")
+
+    # Save the trained model
+    torch.save(model.state_dict(), "large_concept_model/models/lcm_model.pt")
+    print("Model saved to large_concept_model/models/lcm_model.pt")
 
 
 # Inference
-def generate(model, initial_sequence, eot_embedding, max_length=50, threshold=0.9):
-    sequence = initial_sequence.clone()
-    for _ in range(max_length):
-        pred = model(sequence)
-        next_emb = pred[:, -1, :]
-        sim_eot = torch.cosine_similarity(next_emb, eot_embedding, dim=-1)
-        if sim_eot > threshold:
-            break
-        if sequence.size(1) > 1:
-            sim_prev = torch.cosine_similarity(next_emb, sequence[:, -1, :], dim=-1)
-            if sim_prev > threshold:
+def generate(
+    model, initial_sequence, eot_embedding, max_length=50, threshold=0.9, device=None
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    model = model.to(device)
+    sequence = initial_sequence.clone().to(device)
+    eot_embedding = eot_embedding.to(device)
+
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max_length):
+            pred = model(sequence)
+            next_emb = pred[:, -1, :]
+
+            # Check if we're close to the end-of-text embedding
+            sim_eot = torch.cosine_similarity(next_emb, eot_embedding, dim=-1)
+            if sim_eot > threshold:
+                print("End of text detected")
                 break
-        sequence = torch.cat([sequence, next_emb.unsqueeze(1)], dim=1)
+
+            # Check if we're repeating ourselves
+            if sequence.size(1) > 1:
+                sim_prev = torch.cosine_similarity(next_emb, sequence[:, -1, :], dim=-1)
+                if sim_prev > threshold:
+                    print("Repetition detected")
+                    break
+
+            sequence = torch.cat([sequence, next_emb.unsqueeze(1)], dim=1)
+
     return sequence
 
 
 # Main Execution
 if __name__ == "__main__":
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Example: Load 'wikitext' dataset from Hugging Face
     dataset_name = "wikitext"
-    config_name = "wikitext-2-raw-v1"  # Choose one of the available configs
+    config_name = "wikitext-2-raw-v1"  # Using a smaller dataset for faster processing
     split = "train"
     text_column = "text"
+
+    # Download SpaCy model in advance
+    try:
+        spacy.load("en_core_web_sm")
+    except OSError:
+        print("Downloading SpaCy model...")
+        subprocess.run(
+            ["python", "-m", "spacy", "download", "en_core_web_sm"], check=True
+        )
+
+    # Prepare data
     prepare_data(
         dataset_name,
         config_name=config_name,
@@ -233,28 +332,44 @@ if __name__ == "__main__":
     )
 
     # Load embeddings
-    embeddings = torch.tensor(
-        np.load("large_concept_model/data/processed/embeddings.npy"),
-        dtype=torch.float32,
-    ).to(device)
+    embeddings_path = "large_concept_model/data/processed/embeddings.npy"
+    embeddings = torch.tensor(np.load(embeddings_path), dtype=torch.float32)
     eot_embedding = embeddings[-1].unsqueeze(0)  # "End of text." embedding
 
+    print(
+        f"Loaded {embeddings.shape[0]} embeddings with dimension {embeddings.shape[1]}"
+    )
+
     # Fit scaler
+    print("Fitting robust scaler to normalize embeddings...")
     scaler = RobustScaler()
     scaler.fit(embeddings.cpu().numpy())
 
-    # Initialize and train model
-    model = LCMModel(scaler=scaler).to(device)
+    # Initialize model
+    print("Initializing model...")
+    model = LCMModel(d_model=embeddings.shape[1], scaler=scaler)
+
+    # Create dataset and dataloader
+    print("Creating dataset and dataloader...")
     dataset = EmbeddingDataset(embeddings)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-    train(model, dataloader, device=device)
+
+    # Train model
+    print("Starting training...")
+    train(
+        model, dataloader, epochs=5, device=device
+    )  # Reduced epochs for faster execution
 
     # Perform inference
+    print("Performing inference...")
     decoder = SonarDecoder(device=device)
     initial_sequence = embeddings[:5].unsqueeze(0)  # Use first 5 embeddings as prompt
-    generated_sequence = generate(model, initial_sequence, eot_embedding)
-    generated_texts = decoder.decode(generated_sequence[0], "eng_Latn")
-    print("Generated Text:", generated_texts)
+
+    generated_sequence = generate(model, initial_sequence, eot_embedding, device=device)
+    generated_texts = decoder.decode(generated_sequence[0].cpu(), "eng_Latn")
+
+    print("\nGenerated Text:")
+    print(generated_texts)
 
     # Basic evaluation
-    print("Evaluation: Check generated text coherence manually.")
+    print("\nEvaluation: Check generated text coherence manually.")
