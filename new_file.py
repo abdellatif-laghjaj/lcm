@@ -86,7 +86,11 @@ class LCMModel(nn.Module):
             return x * self.scale + self.median
         return x
 
+    # In the LCMModel class, modify the forward method:
+
     def forward(self, src):
+        # Ensure consistent dtype
+        src = src.to(torch.float32)
         src = self.normalize(src)
         positions = (
             torch.arange(0, src.size(1), device=src.device)
@@ -95,7 +99,7 @@ class LCMModel(nn.Module):
         )
         src = src + self.pos_encoder(positions)
         mask = nn.Transformer.generate_square_subsequent_mask(src.size(1)).to(
-            src.device
+            device=src.device, dtype=torch.float32
         )
         output = self.transformer(src, mask=mask)
         output = self.output_layer(output)
@@ -176,6 +180,7 @@ def prepare_data(
     output_file="large_concept_model/data/processed/embeddings.npy",
     device=None,
     batch_size=1000,
+    sample_percentage=100,
 ):
     """
     Load a dataset from Hugging Face and prepare embeddings for LCM.
@@ -189,6 +194,7 @@ def prepare_data(
         output_file (str): Path to save the embeddings.
         device: Device to run encoding on (torch.device or str).
         batch_size (int): Number of texts to process per batch.
+        sample_percentage (float): Percentage of the dataset to use (0-100).
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -204,18 +210,34 @@ def prepare_data(
             spacy_lang = "en"
         elif lang_base == "fra":
             spacy_lang = "fr"
+        # Add more mappings as needed
 
+    print(f"Using device: {device}")
     print(f"Loading dataset: {dataset_name}, config: {config_name}, split: {split}")
 
     # Load dataset from Hugging Face
     try:
         dataset = load_dataset(dataset_name, config_name, split=split)
+
+        # Sample a subset of the dataset if requested
+        if sample_percentage < 100:
+            sample_size = int(len(dataset) * (sample_percentage / 100))
+            # Use random sampling without replacement
+            sample_indices = np.random.choice(
+                len(dataset), size=sample_size, replace=False
+            )
+            dataset = dataset.select(sample_indices)
+            print(
+                f"Sampled {sample_size} examples ({sample_percentage}% of original dataset)"
+            )
+
         texts = dataset[text_column]
     except Exception as e:
         raise ValueError(
             f"Failed to load dataset '{dataset_name}' or access column '{text_column}': {str(e)}"
         )
 
+    # Rest of the function remains the same
     encoder = SonarEncoder(device=device)
     all_embeddings = []
 
@@ -242,7 +264,7 @@ def train(model, dataloader, epochs=10, lr=1e-4, device="cuda"):
     if isinstance(device, str):
         device = torch.device(device)
 
-    model = model.to(device)
+    model = model.to(device).type(torch.float32)  # Ensure float32
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -250,7 +272,9 @@ def train(model, dataloader, epochs=10, lr=1e-4, device="cuda"):
     for epoch in range(epochs):
         total_loss = 0
         for src, tgt in dataloader:
-            src, tgt = src.to(device), tgt.to(device)
+            src = src.to(device=device, dtype=torch.float32)
+            tgt = tgt.to(device=device, dtype=torch.float32)
+
             optimizer.zero_grad()
             pred = model(src)
             loss = criterion(pred, tgt)
@@ -329,6 +353,7 @@ if __name__ == "__main__":
         split=split,
         text_column=text_column,
         device=device,
+        sample_percentage=10,
     )
 
     # Load embeddings
@@ -347,7 +372,11 @@ if __name__ == "__main__":
 
     # Initialize model
     print("Initializing model...")
-    model = LCMModel(d_model=embeddings.shape[1], scaler=scaler)
+    model = (
+        LCMModel(d_model=embeddings.shape[1], scaler=scaler)
+        .to(device)
+        .type(torch.float32)
+    )
 
     # Create dataset and dataloader
     print("Creating dataset and dataloader...")
