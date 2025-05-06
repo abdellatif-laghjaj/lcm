@@ -56,19 +56,14 @@ class SonarDecoder:
         return self.model.predict(embeddings, target_lang=lang)
 
 
-# LCM Model
-class LCMModel(nn.Module):
+# Base Model with common functionality
+class BaseLCM(nn.Module):
     def __init__(
         self, d_model=1024, nhead=8, num_layers=12, dim_feedforward=2048, scaler=None
     ):
         super().__init__()
         self.d_model = d_model
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         self.pos_encoder = nn.Embedding(50, d_model)  # Max seq len 50
-        self.output_layer = nn.Linear(d_model, d_model)
         if scaler:
             self.register_buffer("median", torch.tensor(scaler.center_))
             self.register_buffer("scale", torch.tensor(scaler.scale_))
@@ -86,24 +81,145 @@ class LCMModel(nn.Module):
             return x * self.scale + self.median
         return x
 
-    # In the LCMModel class, modify the forward method:
+    def forward(self, src):
+        # To be implemented by subclasses
+        raise NotImplementedError("Subclasses must implement forward method")
+
+
+# Standard autoregressive model with causal attention
+class OneTowerLCM(BaseLCM):
+    def __init__(
+        self, d_model=1024, nhead=8, num_layers=12, dim_feedforward=2048, scaler=None
+    ):
+        super().__init__(d_model, nhead, num_layers, dim_feedforward, scaler)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.output_layer = nn.Linear(d_model, d_model)
 
     def forward(self, src):
         # Ensure consistent dtype
         src = src.to(torch.float32)
         src = self.normalize(src)
+
+        # Add positional encodings
         positions = (
             torch.arange(0, src.size(1), device=src.device)
             .unsqueeze(0)
             .repeat(src.size(0), 1)
         )
         src = src + self.pos_encoder(positions)
+
+        # Create causal mask for autoregressive generation
         mask = nn.Transformer.generate_square_subsequent_mask(src.size(1)).to(
             device=src.device, dtype=torch.float32
         )
+
+        # Forward pass through transformer
         output = self.transformer(src, mask=mask)
         output = self.output_layer(output)
+
         return self.denormalize(output)
+
+
+# Two-tower architecture with separate encoder and predictor
+class TwoTowerLCM(BaseLCM):
+    def __init__(
+        self, d_model=1024, nhead=8, num_layers=12, dim_feedforward=2048, scaler=None
+    ):
+        super().__init__(d_model, nhead, num_layers, dim_feedforward, scaler)
+
+        # Encoder tower - bidirectional attention
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, batch_first=True
+        )
+        self.encoder_tower = nn.TransformerEncoder(encoder_layer, num_layers // 2)
+
+        # Predictor tower - causal attention
+        predictor_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, batch_first=True
+        )
+        self.predictor_tower = nn.TransformerEncoder(predictor_layer, num_layers // 2)
+
+        self.output_layer = nn.Linear(d_model, d_model)
+        self.intermediate_layer = nn.Linear(d_model, d_model)
+
+        # Cross attention between towers
+        self.cross_attention = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+
+    def forward(self, src):
+        # Ensure consistent dtype
+        src = src.to(torch.float32)
+        src = self.normalize(src)
+
+        # Add positional encodings
+        positions = (
+            torch.arange(0, src.size(1), device=src.device)
+            .unsqueeze(0)
+            .repeat(src.size(0), 1)
+        )
+        src_pos = src + self.pos_encoder(positions)
+
+        # Encoder tower - bidirectional attention (no mask)
+        encoder_output = self.encoder_tower(src_pos)
+        encoder_output = self.intermediate_layer(encoder_output)
+
+        # Predictor tower - causal attention
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            src_pos.size(1)
+        ).to(device=src.device, dtype=torch.float32)
+        predictor_output = self.predictor_tower(src_pos, mask=causal_mask)
+
+        # Cross-attention between towers
+        attn_output, _ = self.cross_attention(
+            predictor_output, encoder_output, encoder_output
+        )
+
+        # Combine and project
+        output = self.output_layer(attn_output + predictor_output)
+
+        return self.denormalize(output)
+
+
+# The original LCM model, maintained for backward compatibility
+class LCMModel(OneTowerLCM):
+    def __init__(
+        self, d_model=1024, nhead=8, num_layers=12, dim_feedforward=2048, scaler=None
+    ):
+        super().__init__(d_model, nhead, num_layers, dim_feedforward, scaler)
+
+
+# Function to initialize the appropriate model
+def create_model(
+    model_type, d_model=1024, nhead=8, num_layers=12, dim_feedforward=2048, scaler=None
+):
+    """
+    Create and return the specified LCM model.
+
+    Args:
+        model_type (str): Type of model to create ('baselcm', 'onetower', or 'twotower')
+        d_model (int): Dimension of the model
+        nhead (int): Number of attention heads
+        num_layers (int): Number of transformer layers
+        dim_feedforward (int): Hidden dimension of feed-forward layers
+        scaler: Scaler for embedding normalization
+
+    Returns:
+        The initialized model
+    """
+    model_type = model_type.lower()
+
+    if model_type == "baselcm" or model_type == "base":
+        return OneTowerLCM(d_model, nhead, num_layers, dim_feedforward, scaler)
+    elif model_type == "onetower" or model_type == "one":
+        return OneTowerLCM(d_model, nhead, num_layers, dim_feedforward, scaler)
+    elif model_type == "twotower" or model_type == "two":
+        return TwoTowerLCM(d_model, nhead, num_layers, dim_feedforward, scaler)
+    else:
+        raise ValueError(
+            f"Unknown model type: {model_type}. Choose from 'baselcm', 'onetower', or 'twotower'."
+        )
 
 
 # Dataset
@@ -327,15 +443,21 @@ def generate(
 
 # Main Execution
 if __name__ == "__main__":
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Example: Load 'wikitext' dataset from Hugging Face
+    # Direct variable assignment for Kaggle compatibility
     dataset_name = "wikitext"
-    config_name = "wikitext-2-raw-v1"  # Using a smaller dataset for faster processing
+    config_name = "wikitext-103-raw-v1"
     split = "train"
     text_column = "text"
+    sample_percentage = 100
+    epochs = 10
+    batch_size = 8
+    lr = 1e-4
+    device = "cuda"
+    model_type = "onetower"
+
+    # Set device
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # Download SpaCy model in advance
     try:
@@ -353,7 +475,7 @@ if __name__ == "__main__":
         split=split,
         text_column=text_column,
         device=device,
-        sample_percentage=10,
+        sample_percentage=sample_percentage,
     )
 
     # Load embeddings
@@ -373,7 +495,7 @@ if __name__ == "__main__":
     # Initialize model
     print("Initializing model...")
     model = (
-        LCMModel(d_model=embeddings.shape[1], scaler=scaler)
+        create_model(model_type, d_model=embeddings.shape[1], scaler=scaler)
         .to(device)
         .type(torch.float32)
     )
@@ -381,13 +503,11 @@ if __name__ == "__main__":
     # Create dataset and dataloader
     print("Creating dataset and dataloader...")
     dataset = EmbeddingDataset(embeddings)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Train model
     print("Starting training...")
-    train(
-        model, dataloader, epochs=5, device=device
-    )  # Reduced epochs for faster execution
+    train(model, dataloader, epochs=epochs, lr=lr, device=device)
 
     # Perform inference
     print("Performing inference...")
