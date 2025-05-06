@@ -513,8 +513,11 @@ if __name__ == "__main__":
     print("Performing inference...")
     decoder = SonarDecoder(device=device)
     initial_sequence = embeddings[:5].unsqueeze(0)  # Use first 5 embeddings as prompt
+    print("Initial Sequence: ", initial_sequence)
 
     generated_sequence = generate(model, initial_sequence, eot_embedding, device=device)
+    print("Generated Sequence: ", generated_sequence)
+
     generated_texts = decoder.decode(generated_sequence[0].cpu(), "eng_Latn")
 
     print("\nGenerated Text:")
